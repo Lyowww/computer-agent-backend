@@ -791,7 +791,14 @@ export class AppWebsocketGateway
     const stale = this.connections.getStaleSockets(app.CONNECTION_TIMEOUT_MS);
     for (const client of stale) {
       this.logger.warn(`Disconnecting stale socket ${client.socketId}`);
-      this.server.sockets.sockets.get(client.socketId)?.disconnect(true);
+      // Namespace gateway: `this.server` is a Namespace — no `.sockets.sockets`.
+      // Use the registry's live refs instead.
+      if (!this.connections.disconnectSocket(client.socketId, true)) {
+        const ns = this.server as unknown as {
+          sockets?: Map<string, Socket>;
+        };
+        ns.sockets?.get(client.socketId)?.disconnect(true);
+      }
     }
   }
 

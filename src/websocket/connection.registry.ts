@@ -169,7 +169,17 @@ export class ConnectionRegistry {
   getStaleSockets(timeoutMs: number): ConnectedClient[] {
     const now = Date.now();
     return [...this.bySocket.values()].filter(
-      (c) => now - c.lastPongAt > timeoutMs,
+      (c) =>
+        // Web clients do not heartbeat; only desktop agents can go stale.
+        c.channel === 'desktop-agent' && now - c.lastPongAt > timeoutMs,
     );
+  }
+
+  /** Disconnect via the live socket ref (safe for namespaced `/ws` gateways). */
+  disconnectSocket(socketId: string, force = true): boolean {
+    const socket = this.socketRefs.get(socketId);
+    if (!socket) return false;
+    socket.disconnect(force);
+    return true;
   }
 }
