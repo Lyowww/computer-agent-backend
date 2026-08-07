@@ -32,6 +32,69 @@ export const captureScreenSchema = z.object({
   requestId: z.string().min(1).max(64),
   quality: z.number().int().min(1).max(100).optional(),
   taskId: z.string().uuid().optional(),
+  deviceId: z.string().uuid().optional(),
+});
+
+export const userMessageSchema = z.object({
+  requestId: z.string().min(1).max(64).optional(),
+  taskId: z.string().uuid().optional(),
+  content: z.string().min(1).max(4000),
+  deviceId: z.string().uuid().optional(),
+  useAi: z.boolean().optional().default(true),
+});
+
+export const notifySchema = z.object({
+  requestId: z.string().min(1).max(64),
+  title: z.string().max(200).optional(),
+  body: z.string().min(1).max(4000),
+  deviceId: z.string().uuid().optional(),
+  from: z.string().max(200).optional(),
+});
+
+export const listQuerySchema = z.object({
+  requestId: z.string().min(1).max(64),
+  deviceId: z.string().uuid().optional(),
+  limit: z.number().int().min(1).max(100).optional(),
+});
+
+export const processesResultSchema = z.object({
+  requestId: z.string().min(1).max(64),
+  processes: z
+    .array(
+      z.object({
+        pid: z.number().int().nonnegative(),
+        name: z.string().min(1).max(256),
+        cpu: z.number().optional(),
+      }),
+    )
+    .max(100),
+  error: z.string().max(2000).optional(),
+});
+
+export const appsResultSchema = z.object({
+  requestId: z.string().min(1).max(64),
+  apps: z
+    .array(
+      z.object({
+        name: z.string().min(1).max(256),
+        path: z.string().max(1024).optional(),
+        running: z.boolean(),
+      }),
+    )
+    .max(100),
+  error: z.string().max(2000).optional(),
+});
+
+export const notifyResultSchema = z.object({
+  requestId: z.string().min(1).max(64),
+  success: z.boolean(),
+  delivered: z.boolean().optional(),
+  error: z.string().max(2000).optional(),
+});
+
+export const pingSchema = z.object({
+  requestId: z.string().min(1).max(64).optional(),
+  nonce: z.string().min(8).max(128).optional(),
 });
 
 export const screenResultSchema = z.object({
@@ -107,18 +170,6 @@ export const actionResultSchema = z.object({
   success: z.boolean(),
   result: z.record(z.unknown()).optional(),
   error: z.string().max(2000).optional(),
-});
-
-export const userMessageSchema = z.object({
-  requestId: z.string().min(1).max(64).optional(),
-  taskId: z.string().uuid().optional(),
-  content: z.string().min(1).max(4000),
-  deviceId: z.string().uuid().optional(),
-});
-
-export const pingSchema = z.object({
-  requestId: z.string().min(1).max(64).optional(),
-  nonce: z.string().min(8).max(128).optional(),
 });
 
 export type LoginDto = z.infer<typeof loginSchema>;

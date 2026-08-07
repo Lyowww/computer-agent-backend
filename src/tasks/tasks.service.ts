@@ -182,6 +182,7 @@ export class TasksService {
     const sent = this.connections.sendToDevice(device.id, 'CAPTURE_SCREEN', {
       requestId,
       quality: opts.quality ?? 80,
+      deviceId: device.id,
     });
     if (!sent) {
       await this.redis.del(`capture-user:${requestId}`);
@@ -189,6 +190,77 @@ export class TasksService {
     }
 
     return { requestId, deviceId: device.id };
+  }
+
+  async notifyDevice(
+    userId: string,
+    input: {
+      requestId: string;
+      body: string;
+      title?: string;
+      deviceId?: string;
+      from?: string;
+      persist?: boolean;
+    },
+  ) {
+    const device = await this.devices.getActiveDeviceForUser(
+      userId,
+      input.deviceId,
+    );
+    if (!this.connections.isDeviceOnline(device.id)) {
+      throw new BadRequestException('Device is not connected via WebSocket');
+    }
+
+    if (input.persist !== false) {
+      await this.prisma.chatMessage.create({
+        data: {
+          userId,
+          role: MessageRole.USER,
+          content: input.body,
+          metadata: { kind: 'notify', deviceId: device.id },
+        },
+      });
+    }
+
+    await this.redis.set(`notify-user:${input.requestId}`, userId, 120);
+    const sent = this.connections.sendToDevice(device.id, 'NOTIFY', {
+      requestId: input.requestId,
+      title: input.title ?? 'Message from dashboard',
+      body: input.body,
+      from: input.from ?? 'dashboard',
+    });
+    if (!sent) {
+      throw new BadRequestException('Failed to reach device');
+    }
+    return { requestId: input.requestId, deviceId: device.id };
+  }
+
+  async requestDeviceList(
+    userId: string,
+    kind: 'LIST_PROCESSES' | 'LIST_APPS',
+    input: { requestId: string; deviceId?: string; limit?: number },
+  ) {
+    const device = await this.devices.getActiveDeviceForUser(
+      userId,
+      input.deviceId,
+    );
+    if (!this.connections.isDeviceOnline(device.id)) {
+      throw new BadRequestException('Device is not connected via WebSocket');
+    }
+
+    await this.redis.set(
+      `${kind.toLowerCase()}-user:${input.requestId}`,
+      userId,
+      120,
+    );
+    const sent = this.connections.sendToDevice(device.id, kind, {
+      requestId: input.requestId,
+      limit: input.limit ?? 40,
+    });
+    if (!sent) {
+      throw new BadRequestException('Failed to reach device');
+    }
+    return { requestId: input.requestId, deviceId: device.id };
   }
 
   private async runAiIteration(
@@ -407,16 +479,38 @@ export class TasksService {
 
   async handleUserMessage(
     userId: string,
-    input: { content: string; taskId?: string; deviceId?: string },
+    input: {
+      content: string;
+      taskId?: string;
+      deviceId?: string;
+      useAi?: boolean;
+      requestId?: string;
+    },
   ) {
+    const useAi = input.useAi !== false;
+
     await this.prisma.chatMessage.create({
       data: {
         userId,
         taskId: input.taskId,
         role: MessageRole.USER,
         content: input.content,
+        metadata: { useAi },
       },
     });
+
+    // Notify-only path: no AI planning / no task loop
+    if (!useAi) {
+      const requestId = input.requestId ?? `notify_${uuidv4()}`;
+      const result = await this.notifyDevice(userId, {
+        requestId,
+        body: input.content,
+        title: 'Message from dashboard',
+        deviceId: input.deviceId,
+        persist: false,
+      });
+      return { ok: true, mode: 'notify' as const, ...result };
+    }
 
     if (input.taskId) {
       const task = await this.getOwned(userId, input.taskId);
@@ -426,11 +520,11 @@ export class TasksService {
           data: { instruction: `${task.instruction}\n\nUser: ${input.content}` },
         });
         await this.requestScreenAndPlan(task.id);
-        return { ok: true, resumedTaskId: task.id };
+        return { ok: true, mode: 'ai' as const, resumedTaskId: task.id };
       }
     }
 
-    // New ad-hoc task from chat
+    // New ad-hoc AI task from chat
     if (input.deviceId || !input.taskId) {
       const device = await this.devices.getActiveDeviceForUser(
         userId,
@@ -440,10 +534,10 @@ export class TasksService {
         instruction: input.content,
         deviceId: device.id,
       });
-      return { ok: true, taskId: task.id };
+      return { ok: true, mode: 'ai' as const, taskId: task.id };
     }
 
-    return { ok: true };
+    return { ok: true, mode: 'ai' as const };
   }
 
   private async getOwned(userId: string, taskId: string) {

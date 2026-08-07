@@ -26,8 +26,13 @@ import { RedisService } from '../common/redis/redis.module';
 import { WsEvent } from '../common/events/ws-events';
 import {
   actionResultSchema,
+  appsResultSchema,
   captureScreenSchema,
+  listQuerySchema,
+  notifyResultSchema,
+  notifySchema,
   pingSchema,
+  processesResultSchema,
   registerDeviceWsSchema,
   screenResultSchema,
   userMessageSchema,
@@ -169,15 +174,20 @@ export class AppWebsocketGateway
     @MessageBody() body: unknown,
   ) {
     if (socket.data.channel !== 'desktop-agent') {
-      return this.errorPayload('FORBIDDEN', 'REGISTER_DEVICE only for desktop-agent');
+      return this.fail(socket, 'FORBIDDEN', 'REGISTER_DEVICE only for desktop-agent');
     }
     if (!(await this.rateLimit(socket))) {
-      return this.errorPayload('RATE_LIMITED', 'Too many messages');
+      return this.fail(socket, 'RATE_LIMITED', 'Too many messages');
     }
 
     const parsed = registerDeviceWsSchema.safeParse(body);
     if (!parsed.success) {
-      return this.errorPayload('VALIDATION_ERROR', 'Invalid REGISTER_DEVICE payload', parsed.error.issues);
+      return this.fail(
+        socket,
+        'VALIDATION_ERROR',
+        'Invalid REGISTER_DEVICE payload',
+        parsed.error.issues,
+      );
     }
 
     try {
@@ -226,19 +236,18 @@ export class AppWebsocketGateway
         os: online.os,
       });
 
-      const response = {
-        event: WsEvent.DEVICE_REGISTERED,
-        payload: {
-          deviceId: device.id,
-          name: online.name,
-          os: online.os,
-          connectionStatus: online.connectionStatus,
-        },
+      const responsePayload = {
+        deviceId: device.id,
+        name: online.name,
+        os: online.os,
+        connectionStatus: online.connectionStatus,
       };
-      socket.emit(WsEvent.DEVICE_REGISTERED, response.payload);
-      return response;
+      socket.emit(WsEvent.DEVICE_REGISTERED, responsePayload);
+      // Return plain object (no `event`) so Nest uses Socket.IO ack instead of emitting null.
+      return { ok: true, ...responsePayload };
     } catch (err) {
-      return this.errorPayload(
+      return this.fail(
+        socket,
         'DEVICE_AUTH_FAILED',
         err instanceof Error ? err.message : 'Device authentication failed',
       );
@@ -251,20 +260,20 @@ export class AppWebsocketGateway
     @MessageBody() body: unknown,
   ) {
     if (!this.requireAgent(socket)) {
-      return this.errorPayload('UNAUTHORIZED', 'Device not registered');
+      return this.fail(socket, 'UNAUTHORIZED', 'Device not registered');
     }
     if (!(await this.rateLimit(socket))) {
-      return this.errorPayload('RATE_LIMITED', 'Too many messages');
+      return this.fail(socket, 'RATE_LIMITED', 'Too many messages');
     }
 
     const parsed = screenResultSchema.safeParse(body);
     if (!parsed.success) {
-      return this.errorPayload('VALIDATION_ERROR', 'Invalid SCREEN_RESULT', parsed.error.issues);
+      return this.fail(socket, 'VALIDATION_ERROR', 'Invalid SCREEN_RESULT', parsed.error.issues);
     }
 
     await this.devices.touch(socket.data.deviceId);
     await this.tasks.handleScreenResult(parsed.data);
-    return { event: 'ACK', payload: { requestId: parsed.data.requestId } };
+    return { ok: true, requestId: parsed.data.requestId };
   }
 
   @SubscribeMessage(WsEvent.ACTION_RESULT)
@@ -273,28 +282,89 @@ export class AppWebsocketGateway
     @MessageBody() body: unknown,
   ) {
     if (!this.requireAgent(socket)) {
-      return this.errorPayload('UNAUTHORIZED', 'Device not registered');
+      return this.fail(socket, 'UNAUTHORIZED', 'Device not registered');
     }
     if (!(await this.rateLimit(socket))) {
-      return this.errorPayload('RATE_LIMITED', 'Too many messages');
+      return this.fail(socket, 'RATE_LIMITED', 'Too many messages');
     }
 
     const parsed = actionResultSchema.safeParse(body);
     if (!parsed.success) {
-      return this.errorPayload('VALIDATION_ERROR', 'Invalid ACTION_RESULT', parsed.error.issues);
+      return this.fail(socket, 'VALIDATION_ERROR', 'Invalid ACTION_RESULT', parsed.error.issues);
     }
 
-    // Ownership: action's task must belong to this device
     const task = await this.prisma.task.findUnique({
       where: { id: parsed.data.taskId },
     });
     if (!task || task.deviceId !== socket.data.deviceId) {
-      return this.errorPayload('FORBIDDEN', 'Action does not belong to this device');
+      return this.fail(socket, 'FORBIDDEN', 'Action does not belong to this device');
     }
 
     await this.devices.touch(socket.data.deviceId);
     await this.tasks.handleActionResult(parsed.data);
-    return { event: 'ACK', payload: { actionId: parsed.data.actionId } };
+    return { ok: true, actionId: parsed.data.actionId };
+  }
+
+  @SubscribeMessage(WsEvent.NOTIFY_RESULT)
+  async onNotifyResult(
+    @ConnectedSocket() socket: Socket,
+    @MessageBody() body: unknown,
+  ) {
+    if (!this.requireAgent(socket)) {
+      return this.fail(socket, 'UNAUTHORIZED', 'Device not registered');
+    }
+    const parsed = notifyResultSchema.safeParse(body);
+    if (!parsed.success) {
+      return this.fail(socket, 'VALIDATION_ERROR', 'Invalid NOTIFY_RESULT', parsed.error.issues);
+    }
+    const userId = await this.redis.get(`notify-user:${parsed.data.requestId}`);
+    if (userId) {
+      this.connections.sendToUser(userId, WsEvent.NOTIFY_RESULT, parsed.data);
+      await this.redis.del(`notify-user:${parsed.data.requestId}`);
+    }
+    return { ok: true };
+  }
+
+  @SubscribeMessage(WsEvent.PROCESSES_RESULT)
+  async onProcessesResult(
+    @ConnectedSocket() socket: Socket,
+    @MessageBody() body: unknown,
+  ) {
+    if (!this.requireAgent(socket)) {
+      return this.fail(socket, 'UNAUTHORIZED', 'Device not registered');
+    }
+    const parsed = processesResultSchema.safeParse(body);
+    if (!parsed.success) {
+      return this.fail(socket, 'VALIDATION_ERROR', 'Invalid PROCESSES_RESULT', parsed.error.issues);
+    }
+    const userId = await this.redis.get(
+      `list_processes-user:${parsed.data.requestId}`,
+    );
+    if (userId) {
+      this.connections.sendToUser(userId, WsEvent.PROCESSES_RESULT, parsed.data);
+      await this.redis.del(`list_processes-user:${parsed.data.requestId}`);
+    }
+    return { ok: true };
+  }
+
+  @SubscribeMessage(WsEvent.APPS_RESULT)
+  async onAppsResult(
+    @ConnectedSocket() socket: Socket,
+    @MessageBody() body: unknown,
+  ) {
+    if (!this.requireAgent(socket)) {
+      return this.fail(socket, 'UNAUTHORIZED', 'Device not registered');
+    }
+    const parsed = appsResultSchema.safeParse(body);
+    if (!parsed.success) {
+      return this.fail(socket, 'VALIDATION_ERROR', 'Invalid APPS_RESULT', parsed.error.issues);
+    }
+    const userId = await this.redis.get(`list_apps-user:${parsed.data.requestId}`);
+    if (userId) {
+      this.connections.sendToUser(userId, WsEvent.APPS_RESULT, parsed.data);
+      await this.redis.del(`list_apps-user:${parsed.data.requestId}`);
+    }
+    return { ok: true };
   }
 
   // -------- web-client events --------
@@ -305,25 +375,27 @@ export class AppWebsocketGateway
     @MessageBody() body: unknown,
   ) {
     if (socket.data.channel !== 'web-client' || !socket.data.userId) {
-      return this.errorPayload('FORBIDDEN', 'CAPTURE_SCREEN only for web-client');
+      return this.fail(socket, 'FORBIDDEN', 'CAPTURE_SCREEN only for web-client');
     }
     if (!(await this.rateLimit(socket))) {
-      return this.errorPayload('RATE_LIMITED', 'Too many messages');
+      return this.fail(socket, 'RATE_LIMITED', 'Too many messages');
     }
 
     const parsed = captureScreenSchema.safeParse(body);
     if (!parsed.success) {
-      return this.errorPayload('VALIDATION_ERROR', 'Invalid CAPTURE_SCREEN', parsed.error.issues);
+      return this.fail(socket, 'VALIDATION_ERROR', 'Invalid CAPTURE_SCREEN', parsed.error.issues);
     }
 
     try {
       const result = await this.tasks.captureScreenForUser(socket.data.userId, {
         requestId: parsed.data.requestId,
         quality: parsed.data.quality,
+        deviceId: parsed.data.deviceId,
       });
-      return { event: 'ACK', payload: result };
+      return { ok: true, ...result };
     } catch (err) {
-      return this.errorPayload(
+      return this.fail(
+        socket,
         'CAPTURE_FAILED',
         err instanceof Error ? err.message : 'Capture failed',
         undefined,
@@ -338,19 +410,124 @@ export class AppWebsocketGateway
     @MessageBody() body: unknown,
   ) {
     if (socket.data.channel !== 'web-client' || !socket.data.userId) {
-      return this.errorPayload('FORBIDDEN', 'USER_MESSAGE only for web-client');
+      return this.fail(socket, 'FORBIDDEN', 'USER_MESSAGE only for web-client');
     }
     if (!(await this.rateLimit(socket))) {
-      return this.errorPayload('RATE_LIMITED', 'Too many messages');
+      return this.fail(socket, 'RATE_LIMITED', 'Too many messages');
     }
 
     const parsed = userMessageSchema.safeParse(body);
     if (!parsed.success) {
-      return this.errorPayload('VALIDATION_ERROR', 'Invalid USER_MESSAGE', parsed.error.issues);
+      return this.fail(socket, 'VALIDATION_ERROR', 'Invalid USER_MESSAGE', parsed.error.issues);
     }
 
-    const result = await this.tasks.handleUserMessage(socket.data.userId, parsed.data);
-    return { event: 'ACK', payload: { requestId: parsed.data.requestId, ...result } };
+    try {
+      const result = await this.tasks.handleUserMessage(socket.data.userId, parsed.data);
+      return { requestId: parsed.data.requestId, ...result };
+    } catch (err) {
+      return this.fail(
+        socket,
+        'USER_MESSAGE_FAILED',
+        err instanceof Error ? err.message : 'Failed to handle message',
+        undefined,
+        parsed.data.requestId,
+      );
+    }
+  }
+
+  @SubscribeMessage(WsEvent.NOTIFY)
+  async onNotify(
+    @ConnectedSocket() socket: Socket,
+    @MessageBody() body: unknown,
+  ) {
+    if (socket.data.channel !== 'web-client' || !socket.data.userId) {
+      return this.fail(socket, 'FORBIDDEN', 'NOTIFY only for web-client');
+    }
+    if (!(await this.rateLimit(socket))) {
+      return this.fail(socket, 'RATE_LIMITED', 'Too many messages');
+    }
+    const parsed = notifySchema.safeParse(body);
+    if (!parsed.success) {
+      return this.fail(socket, 'VALIDATION_ERROR', 'Invalid NOTIFY', parsed.error.issues);
+    }
+    try {
+      const result = await this.tasks.notifyDevice(socket.data.userId, parsed.data);
+      return { ok: true, ...result };
+    } catch (err) {
+      return this.fail(
+        socket,
+        'NOTIFY_FAILED',
+        err instanceof Error ? err.message : 'Notify failed',
+        undefined,
+        parsed.data.requestId,
+      );
+    }
+  }
+
+  @SubscribeMessage(WsEvent.LIST_PROCESSES)
+  async onListProcesses(
+    @ConnectedSocket() socket: Socket,
+    @MessageBody() body: unknown,
+  ) {
+    if (socket.data.channel !== 'web-client' || !socket.data.userId) {
+      return this.fail(socket, 'FORBIDDEN', 'LIST_PROCESSES only for web-client');
+    }
+    if (!(await this.rateLimit(socket))) {
+      return this.fail(socket, 'RATE_LIMITED', 'Too many messages');
+    }
+    const parsed = listQuerySchema.safeParse(body);
+    if (!parsed.success) {
+      return this.fail(socket, 'VALIDATION_ERROR', 'Invalid LIST_PROCESSES', parsed.error.issues);
+    }
+    try {
+      const result = await this.tasks.requestDeviceList(
+        socket.data.userId,
+        'LIST_PROCESSES',
+        parsed.data,
+      );
+      return { ok: true, ...result };
+    } catch (err) {
+      return this.fail(
+        socket,
+        'LIST_FAILED',
+        err instanceof Error ? err.message : 'List processes failed',
+        undefined,
+        parsed.data.requestId,
+      );
+    }
+  }
+
+  @SubscribeMessage(WsEvent.LIST_APPS)
+  async onListApps(
+    @ConnectedSocket() socket: Socket,
+    @MessageBody() body: unknown,
+  ) {
+    if (socket.data.channel !== 'web-client' || !socket.data.userId) {
+      return this.fail(socket, 'FORBIDDEN', 'LIST_APPS only for web-client');
+    }
+    if (!(await this.rateLimit(socket))) {
+      return this.fail(socket, 'RATE_LIMITED', 'Too many messages');
+    }
+    const parsed = listQuerySchema.safeParse(body);
+    if (!parsed.success) {
+      return this.fail(socket, 'VALIDATION_ERROR', 'Invalid LIST_APPS', parsed.error.issues);
+    }
+    try {
+      const result = await this.tasks.requestDeviceList(
+        socket.data.userId,
+        'LIST_APPS',
+        parsed.data,
+      );
+      return { ok: true, ...result };
+    } catch (err) {
+      return this.fail(
+        socket,
+        'LIST_FAILED',
+        err instanceof Error ? err.message : 'List apps failed',
+        undefined,
+        parsed.data.requestId,
+      );
+    }
   }
 
   // -------- shared --------
@@ -366,7 +543,7 @@ export class AppWebsocketGateway
     if (payload.nonce) {
       const claimed = await this.redis.claimNonce(payload.nonce, 120);
       if (!claimed) {
-        return this.errorPayload('REPLAY', 'Nonce already used', undefined, payload.requestId);
+        return this.fail(socket, 'REPLAY', 'Nonce already used', undefined, payload.requestId);
       }
     }
 
@@ -380,7 +557,7 @@ export class AppWebsocketGateway
       serverTime: Date.now(),
     };
     socket.emit(WsEvent.PONG, pong);
-    return { event: WsEvent.PONG, payload: pong };
+    return { ok: true, ...pong };
   }
 
   @SubscribeMessage(WsEvent.PONG)
@@ -395,7 +572,7 @@ export class AppWebsocketGateway
     @MessageBody() body: { event?: string; payload?: unknown },
   ) {
     if (!body?.event) {
-      return this.errorPayload('VALIDATION_ERROR', 'Missing event');
+      return this.fail(socket, 'VALIDATION_ERROR', 'Missing event');
     }
     switch (body.event) {
       case WsEvent.REGISTER_DEVICE:
@@ -404,16 +581,28 @@ export class AppWebsocketGateway
         return this.onScreenResult(socket, body.payload);
       case WsEvent.ACTION_RESULT:
         return this.onActionResult(socket, body.payload);
+      case WsEvent.NOTIFY_RESULT:
+        return this.onNotifyResult(socket, body.payload);
+      case WsEvent.PROCESSES_RESULT:
+        return this.onProcessesResult(socket, body.payload);
+      case WsEvent.APPS_RESULT:
+        return this.onAppsResult(socket, body.payload);
       case WsEvent.CAPTURE_SCREEN:
         return this.onCaptureScreen(socket, body.payload);
       case WsEvent.USER_MESSAGE:
         return this.onUserMessage(socket, body.payload);
+      case WsEvent.NOTIFY:
+        return this.onNotify(socket, body.payload);
+      case WsEvent.LIST_PROCESSES:
+        return this.onListProcesses(socket, body.payload);
+      case WsEvent.LIST_APPS:
+        return this.onListApps(socket, body.payload);
       case WsEvent.PING:
         return this.onPing(socket, body.payload);
       case WsEvent.PONG:
         return this.onPong(socket);
       default:
-        return this.errorPayload('UNKNOWN_EVENT', `Unknown event: ${body.event}`);
+        return this.fail(socket, 'UNKNOWN_EVENT', `Unknown event: ${body.event}`);
     }
   }
 
@@ -448,15 +637,19 @@ export class AppWebsocketGateway
     socket.emit(WsEvent.ERROR, { code, message });
   }
 
-  private errorPayload(
+  /**
+   * Explicitly emit ERROR with a real payload, then return a plain ack object.
+   * Avoids Nest IoAdapter `{ event, payload }` → `emit(event, null)` bug.
+   */
+  private fail(
+    socket: Socket,
     code: string,
     message: string,
     details?: unknown,
     requestId?: string,
   ) {
-    return {
-      event: WsEvent.ERROR,
-      payload: { code, message, details, requestId },
-    };
+    const payload = { code, message, details, requestId };
+    socket.emit(WsEvent.ERROR, payload);
+    return { ok: false, ...payload };
   }
 }

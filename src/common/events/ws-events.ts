@@ -12,6 +12,12 @@ export enum WsEvent {
   TASK_FAILED = 'TASK_FAILED',
   USER_MESSAGE = 'USER_MESSAGE',
   AI_RESPONSE = 'AI_RESPONSE',
+  NOTIFY = 'NOTIFY',
+  NOTIFY_RESULT = 'NOTIFY_RESULT',
+  LIST_PROCESSES = 'LIST_PROCESSES',
+  PROCESSES_RESULT = 'PROCESSES_RESULT',
+  LIST_APPS = 'LIST_APPS',
+  APPS_RESULT = 'APPS_RESULT',
   ERROR = 'ERROR',
   PING = 'PING',
   PONG = 'PONG',
@@ -36,6 +42,7 @@ export interface CaptureScreenPayload {
   requestId: string;
   quality?: number;
   taskId?: string;
+  deviceId?: string;
 }
 
 export interface ScreenResultPayload {
@@ -80,6 +87,22 @@ export interface UserMessagePayload {
   taskId?: string;
   content: string;
   deviceId?: string;
+  /** When false, forward as desktop notification only (no AI task). Default true. */
+  useAi?: boolean;
+}
+
+export interface NotifyPayload {
+  requestId: string;
+  title?: string;
+  body: string;
+  from?: string;
+  deviceId?: string;
+}
+
+export interface ListQueryPayload {
+  requestId: string;
+  deviceId?: string;
+  limit?: number;
 }
 
 export interface AiResponsePayload {
