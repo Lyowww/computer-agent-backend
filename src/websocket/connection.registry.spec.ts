@@ -35,4 +35,29 @@ describe('ConnectionRegistry', () => {
     expect(registry.isDeviceOnline('d1')).toBe(false);
     expect(registry.sendToDevice('d1', 'X', {})).toBe(false);
   });
+
+  it('returns false when device sockets are registered but disconnected', async () => {
+    const registry = new ConnectionRegistry();
+    registry.setServer({ to: jest.fn(() => ({ emit: jest.fn() })) } as unknown as Server);
+
+    const socket = {
+      id: 's1',
+      join: jest.fn().mockResolvedValue(undefined),
+      connected: false,
+      emit: jest.fn(),
+    } as unknown as Socket;
+
+    await registry.register(socket, {
+      channel: 'desktop-agent',
+      userId: 'u1',
+      deviceId: 'd1',
+    });
+
+    // Stale registry entry: id map still has the socket, but connected=false.
+    expect(registry.isDeviceOnline('d1')).toBe(false);
+    expect(registry.sendToDevice('d1', 'NOTIFY', { requestId: 'r1', body: 'hi' })).toBe(
+      false,
+    );
+    expect(socket.emit).not.toHaveBeenCalled();
+  });
 });

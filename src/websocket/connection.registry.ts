@@ -90,7 +90,13 @@ export class ConnectionRegistry {
   }
 
   isDeviceOnline(deviceId: string): boolean {
-    return (this.deviceSockets.get(deviceId)?.size ?? 0) > 0;
+    const socketIds = this.deviceSockets.get(deviceId);
+    if (!socketIds || socketIds.size === 0) return false;
+    for (const socketId of socketIds) {
+      const socket = this.socketRefs.get(socketId);
+      if (socket?.connected) return true;
+    }
+    return false;
   }
 
   private emitToSocketIds(socketIds: Iterable<string>, event: string, payload: unknown): number {
@@ -101,10 +107,10 @@ export class ConnectionRegistry {
         socket.emit(event, payload);
         socket.emit('message', { event, payload });
         sent += 1;
-      } else if (this.server) {
-        this.server.to(socketId).emit(event, payload);
-        this.server.to(socketId).emit('message', { event, payload });
-        sent += 1;
+      } else {
+        this.logger.warn(
+          `emit skipped — socket not connected id=${socketId} event=${event}`,
+        );
       }
     }
     return sent;
@@ -118,27 +124,35 @@ export class ConnectionRegistry {
     }
 
     const sent = this.emitToSocketIds(socketIds, event, payload);
-    if (this.server) {
+    // Room broadcast as a belt-and-suspenders path for sockets that joined the room
+    // but keep success tied to live socket refs (room-only emit can silently no-op).
+    if (this.server && sent > 0) {
       this.server.to(`device:${deviceId}`).emit(event, payload);
       this.server.to(`device:${deviceId}`).emit('message', { event, payload });
     }
     this.logger.log(
-      `sendToDevice device=${deviceId} event=${event} sockets=${socketIds.size} direct=${sent}`,
+      `sendToDevice device=${deviceId} event=${event} sockets=${socketIds.size} delivered=${sent}`,
     );
-    return sent > 0 || Boolean(this.server);
+    if (sent === 0) {
+      this.logger.warn(
+        `sendToDevice failed — device=${deviceId} event=${event} had ${socketIds.size} registered socket(s) but none connected`,
+      );
+      return false;
+    }
+    return true;
   }
 
   sendToUser(userId: string, event: string, payload: unknown): boolean {
     const socketIds = this.userSockets.get(userId) ?? new Set<string>();
     const sent = this.emitToSocketIds(socketIds, event, payload);
-    if (this.server) {
+    if (this.server && sent > 0) {
       this.server.to(`user:${userId}`).emit(event, payload);
       this.server.to(`user:${userId}`).emit('message', { event, payload });
     }
     this.logger.log(
-      `sendToUser user=${userId} event=${event} sockets=${socketIds.size} direct=${sent}`,
+      `sendToUser user=${userId} event=${event} sockets=${socketIds.size} delivered=${sent}`,
     );
-    return true;
+    return sent > 0;
   }
 
   requestScreenshot(deviceId: string, requestId: string, taskId: string, quality = 80): boolean {
