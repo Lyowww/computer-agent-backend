@@ -39,4 +39,12 @@ export class DevicesController {
   ) {
     return this.devicesService.revoke(user.userId, id);
   }
+
+  @Post(':id/regenerate-token')
+  regenerateToken(
+    @CurrentUser() user: AuthUser,
+    @Param('id', ParseUUIDPipe) id: string,
+  ) {
+    return this.devicesService.regenerateToken(user.userId, id);
+  }
 }

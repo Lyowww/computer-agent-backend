@@ -112,7 +112,9 @@ export class TasksService {
   }
 
   async handleScreenResult(payload: ScreenResultPayload): Promise<void> {
-    await this.screenshots.storeEphemeral(payload);
+    if (!payload.error && payload.image) {
+      await this.screenshots.storeEphemeral(payload);
+    }
 
     let taskId = payload.taskId ?? null;
     if (!taskId) {
@@ -122,28 +124,40 @@ export class TasksService {
       await this.redis.del(`screen-pending:${payload.requestId}`);
     }
 
-    // Standalone user capture?
+    // Standalone user capture (dashboard / chat screenshot) — deliver even if taskId is set.
     const captureUserId = await this.redis.get(
       `capture-user:${payload.requestId}`,
     );
-    if (captureUserId && !taskId) {
+    if (captureUserId) {
       await this.redis.del(`capture-user:${payload.requestId}`);
       this.connections.sendToUser(captureUserId, 'SCREEN_RESULT', {
         requestId: payload.requestId,
+        taskId: payload.taskId,
         width: payload.width,
         height: payload.height,
         image: payload.image,
         mimeType: payload.mimeType ?? 'image/png',
+        error: payload.error,
       });
       const app = this.config.get<AppConfig>('app')!;
-      if (!app.STORE_SCREENSHOTS) {
+      if (!app.STORE_SCREENSHOTS && payload.image) {
         await this.screenshots.discard(payload.requestId);
       }
-      return;
+      if (!taskId || payload.error) {
+        return;
+      }
     }
 
     if (!taskId) {
       this.logger.debug(`Orphan screen result: ${payload.requestId}`);
+      return;
+    }
+
+    if (payload.error || !payload.image) {
+      this.logger.warn(
+        `Screen capture failed for task ${taskId}: ${payload.error ?? 'missing image'}`,
+      );
+      await this.failTask(taskId, payload.error ?? 'Screenshot failed');
       return;
     }
 
@@ -182,6 +196,7 @@ export class TasksService {
     const sent = this.connections.sendToDevice(device.id, 'CAPTURE_SCREEN', {
       requestId,
       quality: opts.quality ?? 80,
+      maxWidth: 1280,
       deviceId: device.id,
     });
     if (!sent) {
@@ -211,17 +226,7 @@ export class TasksService {
       throw new BadRequestException('Device is not connected via WebSocket');
     }
 
-    if (input.persist !== false) {
-      await this.prisma.chatMessage.create({
-        data: {
-          userId,
-          role: MessageRole.USER,
-          content: input.body,
-          metadata: { kind: 'notify', deviceId: device.id },
-        },
-      });
-    }
-
+    // Forward to the agent first so UI ACK is not blocked by DB writes.
     await this.redis.set(`notify-user:${input.requestId}`, userId, 120);
     const sent = this.connections.sendToDevice(device.id, 'NOTIFY', {
       requestId: input.requestId,
@@ -230,7 +235,25 @@ export class TasksService {
       from: input.from ?? 'dashboard',
     });
     if (!sent) {
+      await this.redis.del(`notify-user:${input.requestId}`);
       throw new BadRequestException('Failed to reach device');
+    }
+
+    if (input.persist !== false) {
+      void this.prisma.chatMessage
+        .create({
+          data: {
+            userId,
+            role: MessageRole.USER,
+            content: input.body,
+            metadata: { kind: 'notify', deviceId: device.id },
+          },
+        })
+        .catch((err) => {
+          this.logger.warn(
+            `Failed to persist notify message: ${err instanceof Error ? err.message : err}`,
+          );
+        });
     }
     return { requestId: input.requestId, deviceId: device.id };
   }
@@ -267,6 +290,11 @@ export class TasksService {
     taskId: string,
     screen: ScreenResultPayload,
   ): Promise<void> {
+    if (!screen.image || screen.width == null || screen.height == null) {
+      await this.failTask(taskId, screen.error ?? 'Screenshot missing for AI iteration');
+      return;
+    }
+
     const task = await this.prisma.task.findUnique({ where: { id: taskId } });
     if (!task || task.status === TaskStatus.CANCELLED) return;
 

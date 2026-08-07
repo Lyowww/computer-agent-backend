@@ -48,10 +48,11 @@ export interface CaptureScreenPayload {
 export interface ScreenResultPayload {
   requestId: string;
   taskId?: string;
-  width: number;
-  height: number;
-  image: string;
+  width?: number;
+  height?: number;
+  image?: string;
   mimeType?: string;
+  error?: string;
 }
 
 export interface ExecuteActionPayload {

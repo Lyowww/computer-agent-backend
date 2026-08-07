@@ -27,7 +27,10 @@ export class ConnectionRegistry {
     this.server = server;
   }
 
-  register(socket: Socket, meta: Omit<ConnectedClient, 'socketId' | 'connectedAt' | 'lastPongAt'>): void {
+  async register(
+    socket: Socket,
+    meta: Omit<ConnectedClient, 'socketId' | 'connectedAt' | 'lastPongAt'>,
+  ): Promise<void> {
     const client: ConnectedClient = {
       socketId: socket.id,
       channel: meta.channel,
@@ -42,13 +45,13 @@ export class ConnectionRegistry {
       const set = this.userSockets.get(meta.userId) ?? new Set();
       set.add(socket.id);
       this.userSockets.set(meta.userId, set);
-      void socket.join(`user:${meta.userId}`);
+      await socket.join(`user:${meta.userId}`);
     }
     if (meta.deviceId) {
       const set = this.deviceSockets.get(meta.deviceId) ?? new Set();
       set.add(socket.id);
       this.deviceSockets.set(meta.deviceId, set);
-      void socket.join(`device:${meta.deviceId}`);
+      await socket.join(`device:${meta.deviceId}`);
     }
 
     this.logger.debug(
@@ -89,7 +92,15 @@ export class ConnectionRegistry {
 
   sendToDevice(deviceId: string, event: string, payload: unknown): boolean {
     if (!this.server) return false;
-    if (!this.isDeviceOnline(deviceId)) return false;
+    const socketIds = this.deviceSockets.get(deviceId);
+    if (!socketIds || socketIds.size === 0) return false;
+
+    // Each socket automatically joins a room named after its id — reliable even
+    // when namespace typing makes `.sockets` maps awkward.
+    for (const socketId of socketIds) {
+      this.server.to(socketId).emit(event, payload);
+      this.server.to(socketId).emit('message', { event, payload });
+    }
     this.server.to(`device:${deviceId}`).emit(event, payload);
     this.server.to(`device:${deviceId}`).emit('message', { event, payload });
     return true;
@@ -97,6 +108,13 @@ export class ConnectionRegistry {
 
   sendToUser(userId: string, event: string, payload: unknown): boolean {
     if (!this.server) return false;
+    const socketIds = this.userSockets.get(userId);
+    if (socketIds) {
+      for (const socketId of socketIds) {
+        this.server.to(socketId).emit(event, payload);
+        this.server.to(socketId).emit('message', { event, payload });
+      }
+    }
     this.server.to(`user:${userId}`).emit(event, payload);
     this.server.to(`user:${userId}`).emit('message', { event, payload });
     return true;
@@ -107,6 +125,7 @@ export class ConnectionRegistry {
       requestId,
       taskId,
       quality,
+      maxWidth: 1280,
     });
   }
 

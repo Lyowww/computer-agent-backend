@@ -55,6 +55,8 @@ function extractBearer(socket: Socket): string | null {
   cors: { origin: true, credentials: true },
   namespace: '/ws',
   transports: ['websocket', 'polling'],
+  // Screenshots are base64 PNG; default ~1MB buffer drops SCREEN_RESULT silently.
+  maxHttpBufferSize: 15e6,
 })
 export class AppWebsocketGateway
   implements OnGatewayInit, OnGatewayConnection, OnGatewayDisconnect, OnModuleDestroy
@@ -110,7 +112,7 @@ export class AppWebsocketGateway
           token,
           { secret: this.config.get<AppConfig>('app')!.JWT_SECRET },
         );
-        this.connections.register(socket, {
+        await this.connections.register(socket, {
           channel: 'web-client',
           userId: payload.sub,
         });
@@ -210,7 +212,7 @@ export class AppWebsocketGateway
         userAgent: socket.handshake.headers['user-agent'],
       });
 
-      this.connections.register(socket, {
+      await this.connections.register(socket, {
         channel: 'desktop-agent',
         userId: device.userId,
         deviceId: device.id,

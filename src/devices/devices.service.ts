@@ -27,6 +27,7 @@ const DEVICE_SAFE_SELECT = {
   revokedAt: true,
   createdAt: true,
   updatedAt: true,
+  deviceToken: true,
 } as const;
 
 @Injectable()
@@ -37,8 +38,7 @@ export class DevicesService {
   ) {}
 
   /**
-   * Provision a new device. Returns plaintext deviceToken ONCE.
-   * Never expose the token to the browser after this response.
+   * Provision a new device. Token is stored and returned so the dashboard can always show it.
    */
   async create(userId: string, dto: CreateDeviceDto) {
     const app = this.config.get<AppConfig>('app')!;
@@ -53,6 +53,7 @@ export class DevicesService {
         os: dto.os as DeviceOs,
         tokenHash,
         tokenPrefix: prefix,
+        deviceToken,
         connectionStatus: ConnectionStatus.OFFLINE,
       },
       select: DEVICE_SAFE_SELECT,
@@ -60,10 +61,9 @@ export class DevicesService {
 
     return {
       device,
-      /** One-time plaintext token for secure agent provisioning — store only on the agent */
       deviceToken,
       warning:
-        'Store deviceToken securely on the desktop agent. It will not be shown again.',
+        'Paste this device token into the desktop agent. It stays visible on the Devices page.',
     };
   }
 
@@ -85,6 +85,30 @@ export class DevicesService {
     return device;
   }
 
+  /**
+   * Rotate token and return the new plaintext (also stored for dashboard display).
+   */
+  async regenerateToken(userId: string, deviceId: string) {
+    await this.getById(userId, deviceId);
+    const app = this.config.get<AppConfig>('app')!;
+    const deviceToken = generateSecureToken(app.DEVICE_TOKEN_BYTES);
+    const tokenHash = await hashToken(deviceToken);
+    const prefix = tokenPrefix(deviceToken);
+
+    const device = await this.prisma.device.update({
+      where: { id: deviceId },
+      data: {
+        tokenHash,
+        tokenPrefix: prefix,
+        deviceToken,
+        connectionStatus: ConnectionStatus.OFFLINE,
+      },
+      select: DEVICE_SAFE_SELECT,
+    });
+
+    return { device, deviceToken };
+  }
+
   async revoke(userId: string, deviceId: string) {
     const device = await this.getById(userId, deviceId);
     return this.prisma.device.update({
@@ -92,9 +116,9 @@ export class DevicesService {
       data: {
         revokedAt: new Date(),
         connectionStatus: ConnectionStatus.REVOKED,
-        // Rotate token hash so old tokens cannot reconnect
         tokenHash: await hashToken(generateSecureToken(32)),
         tokenPrefix: tokenPrefix(generateSecureToken(32)),
+        deviceToken: null,
       },
       select: DEVICE_SAFE_SELECT,
     });
@@ -118,6 +142,13 @@ export class DevicesService {
       if (ok) {
         if (device.connectionStatus === ConnectionStatus.REVOKED) {
           throw new UnauthorizedException('Device revoked');
+        }
+        // Backfill plaintext for older devices created before this column existed.
+        if (!device.deviceToken) {
+          await this.prisma.device.update({
+            where: { id: device.id },
+            data: { deviceToken },
+          });
         }
         return device;
       }

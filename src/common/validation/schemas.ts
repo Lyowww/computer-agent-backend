@@ -97,14 +97,31 @@ export const pingSchema = z.object({
   nonce: z.string().min(8).max(128).optional(),
 });
 
-export const screenResultSchema = z.object({
-  requestId: z.string().min(1).max(64),
-  taskId: z.string().uuid().optional(),
-  width: z.number().int().positive().max(10000),
-  height: z.number().int().positive().max(10000),
-  image: z.string().min(1).max(15_000_000),
-  mimeType: z.enum(['image/png', 'image/jpeg', 'image/webp']).optional(),
-});
+export const screenResultSchema = z
+  .object({
+    requestId: z.string().min(1).max(64),
+    taskId: z.string().uuid().optional(),
+    width: z.number().int().nonnegative().max(10000).optional(),
+    height: z.number().int().nonnegative().max(10000).optional(),
+    image: z.string().max(15_000_000).optional(),
+    mimeType: z.enum(['image/png', 'image/jpeg', 'image/webp']).optional(),
+    error: z.string().max(2000).optional(),
+  })
+  .superRefine((val, ctx) => {
+    if (val.error) return;
+    if (
+      !val.image ||
+      val.width == null ||
+      val.height == null ||
+      val.width < 1 ||
+      val.height < 1
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'image, width, and height are required unless error is set',
+      });
+    }
+  });
 
 export const actionTypeSchema = z.enum([
   'CLICK',

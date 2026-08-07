@@ -89,10 +89,12 @@ model Device {
   user             User             @relation(fields: [userId], references: [id], onDelete: Cascade)
   name             String
   os               DeviceOs
-  /// Hashed device auth token — never expose plaintext after provisioning
+  /// Hashed device auth token
   tokenHash        String
   /// Token prefix for lookup without storing full token
   tokenPrefix      String
+  /// Recoverable plaintext token shown in the dashboard (owner-only APIs)
+  deviceToken      String?
   connectionStatus ConnectionStatus @default(OFFLINE)
   lastSeenAt       DateTime?
   revokedAt        DateTime?

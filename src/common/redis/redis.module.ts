@@ -52,22 +52,36 @@ export class RedisService implements OnModuleDestroy {
     }
   }
 
-  /** Simple sliding-window rate limit: returns true if allowed */
+  /** Simple sliding-window rate limit: returns true if allowed. Fail-open if Redis is slow/down. */
   async checkRateLimit(
     key: string,
     max: number,
     windowMs: number,
   ): Promise<boolean> {
-    const now = Date.now();
-    const windowKey = `rl:${key}`;
-    const multi = this.client.multi();
-    multi.zremrangebyscore(windowKey, 0, now - windowMs);
-    multi.zadd(windowKey, now, `${now}-${Math.random()}`);
-    multi.zcard(windowKey);
-    multi.pexpire(windowKey, windowMs);
-    const results = await multi.exec();
-    const count = (results?.[2]?.[1] as number) ?? 0;
-    return count <= max;
+    try {
+      const now = Date.now();
+      const windowKey = `rl:${key}`;
+      const multi = this.client.multi();
+      multi.zremrangebyscore(windowKey, 0, now - windowMs);
+      multi.zadd(windowKey, now, `${now}-${Math.random()}`);
+      multi.zcard(windowKey);
+      multi.pexpire(windowKey, windowMs);
+      const results = await Promise.race([
+        multi.exec(),
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 2000)),
+      ]);
+      if (!results) {
+        this.logger.warn('Redis rate-limit timed out; allowing request');
+        return true;
+      }
+      const count = (results?.[2]?.[1] as number) ?? 0;
+      return count <= max;
+    } catch (error) {
+      this.logger.warn(
+        `Redis rate-limit failed; allowing request (${error instanceof Error ? error.message : error})`,
+      );
+      return true;
+    }
   }
 
   /** Replay protection: set nonce if not seen; returns false if replay */
@@ -97,8 +111,11 @@ export class RedisService implements OnModuleDestroy {
       useFactory: (config: ConfigService) => {
         const app = config.get<AppConfig>('app')!;
         const client = new Redis(app.REDIS_URL, {
-          maxRetriesPerRequest: 3,
+          maxRetriesPerRequest: 2,
+          connectTimeout: 5000,
+          commandTimeout: 3000,
           lazyConnect: false,
+          enableOfflineQueue: false,
         });
         client.on('error', (err) => {
           Logger.error(`Redis error: ${err.message}`, undefined, 'Redis');
