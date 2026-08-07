@@ -13,13 +13,14 @@ export interface ConnectedClient {
 
 /**
  * In-memory registry of WebSocket connections.
- * Separates routing from Nest gateways so tasks/AI can emit without circular deps.
+ * Keeps live Socket references so emits do not depend on room join timing.
  */
 @Injectable()
 export class ConnectionRegistry {
   private readonly logger = new Logger(ConnectionRegistry.name);
   private server: Server | null = null;
   private readonly bySocket = new Map<string, ConnectedClient>();
+  private readonly socketRefs = new Map<string, Socket>();
   private readonly userSockets = new Map<string, Set<string>>();
   private readonly deviceSockets = new Map<string, Set<string>>();
 
@@ -40,6 +41,7 @@ export class ConnectionRegistry {
       lastPongAt: Date.now(),
     };
     this.bySocket.set(socket.id, client);
+    this.socketRefs.set(socket.id, socket);
 
     if (meta.userId) {
       const set = this.userSockets.get(meta.userId) ?? new Set();
@@ -54,7 +56,7 @@ export class ConnectionRegistry {
       await socket.join(`device:${meta.deviceId}`);
     }
 
-    this.logger.debug(
+    this.logger.log(
       `Registered ${meta.channel} socket=${socket.id} user=${meta.userId ?? '-'} device=${meta.deviceId ?? '-'}`,
     );
   }
@@ -63,6 +65,7 @@ export class ConnectionRegistry {
     const client = this.bySocket.get(socketId);
     if (!client) return undefined;
     this.bySocket.delete(socketId);
+    this.socketRefs.delete(socketId);
 
     if (client.userId) {
       const set = this.userSockets.get(client.userId);
@@ -90,33 +93,51 @@ export class ConnectionRegistry {
     return (this.deviceSockets.get(deviceId)?.size ?? 0) > 0;
   }
 
-  sendToDevice(deviceId: string, event: string, payload: unknown): boolean {
-    if (!this.server) return false;
-    const socketIds = this.deviceSockets.get(deviceId);
-    if (!socketIds || socketIds.size === 0) return false;
-
-    // Each socket automatically joins a room named after its id — reliable even
-    // when namespace typing makes `.sockets` maps awkward.
+  private emitToSocketIds(socketIds: Iterable<string>, event: string, payload: unknown): number {
+    let sent = 0;
     for (const socketId of socketIds) {
-      this.server.to(socketId).emit(event, payload);
-      this.server.to(socketId).emit('message', { event, payload });
+      const socket = this.socketRefs.get(socketId);
+      if (socket?.connected) {
+        socket.emit(event, payload);
+        socket.emit('message', { event, payload });
+        sent += 1;
+      } else if (this.server) {
+        this.server.to(socketId).emit(event, payload);
+        this.server.to(socketId).emit('message', { event, payload });
+        sent += 1;
+      }
     }
-    this.server.to(`device:${deviceId}`).emit(event, payload);
-    this.server.to(`device:${deviceId}`).emit('message', { event, payload });
-    return true;
+    return sent;
+  }
+
+  sendToDevice(deviceId: string, event: string, payload: unknown): boolean {
+    const socketIds = this.deviceSockets.get(deviceId);
+    if (!socketIds || socketIds.size === 0) {
+      this.logger.warn(`sendToDevice missed — no sockets for device=${deviceId} event=${event}`);
+      return false;
+    }
+
+    const sent = this.emitToSocketIds(socketIds, event, payload);
+    if (this.server) {
+      this.server.to(`device:${deviceId}`).emit(event, payload);
+      this.server.to(`device:${deviceId}`).emit('message', { event, payload });
+    }
+    this.logger.log(
+      `sendToDevice device=${deviceId} event=${event} sockets=${socketIds.size} direct=${sent}`,
+    );
+    return sent > 0 || Boolean(this.server);
   }
 
   sendToUser(userId: string, event: string, payload: unknown): boolean {
-    if (!this.server) return false;
-    const socketIds = this.userSockets.get(userId);
-    if (socketIds) {
-      for (const socketId of socketIds) {
-        this.server.to(socketId).emit(event, payload);
-        this.server.to(socketId).emit('message', { event, payload });
-      }
+    const socketIds = this.userSockets.get(userId) ?? new Set<string>();
+    const sent = this.emitToSocketIds(socketIds, event, payload);
+    if (this.server) {
+      this.server.to(`user:${userId}`).emit(event, payload);
+      this.server.to(`user:${userId}`).emit('message', { event, payload });
     }
-    this.server.to(`user:${userId}`).emit(event, payload);
-    this.server.to(`user:${userId}`).emit('message', { event, payload });
+    this.logger.log(
+      `sendToUser user=${userId} event=${event} sockets=${socketIds.size} direct=${sent}`,
+    );
     return true;
   }
 

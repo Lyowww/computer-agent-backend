@@ -391,13 +391,21 @@ export class AppWebsocketGateway
     }
 
     try {
+      this.logger.log(
+        `CAPTURE_SCREEN from user=${socket.data.userId} device=${parsed.data.deviceId ?? 'auto'} requestId=${parsed.data.requestId}`,
+      );
       const result = await this.tasks.captureScreenForUser(socket.data.userId, {
         requestId: parsed.data.requestId,
         quality: parsed.data.quality,
         deviceId: parsed.data.deviceId,
       });
+      // Explicit event ACK as well as Nest return-value ACK (more reliable across Nest/Socket.IO).
+      socket.emit('REQUEST_ACK', { event: WsEvent.CAPTURE_SCREEN, ok: true, ...result });
       return { ok: true, ...result };
     } catch (err) {
+      this.logger.warn(
+        `CAPTURE_SCREEN failed: ${err instanceof Error ? err.message : err}`,
+      );
       return this.fail(
         socket,
         'CAPTURE_FAILED',
@@ -456,6 +464,7 @@ export class AppWebsocketGateway
     }
     try {
       const result = await this.tasks.notifyDevice(socket.data.userId, parsed.data);
+      socket.emit('REQUEST_ACK', { event: WsEvent.NOTIFY, ok: true, ...result });
       return { ok: true, ...result };
     } catch (err) {
       return this.fail(
