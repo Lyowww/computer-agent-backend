@@ -243,6 +243,9 @@ export class TasksService {
       this.pending.del(`notify-user:${input.requestId}`);
       throw new BadRequestException('Failed to reach device');
     }
+    this.logger.log(
+      `NOTIFY forwarded to device=${device.id} requestId=${input.requestId}`,
+    );
 
     if (input.persist !== false) {
       void this.prisma.chatMessage

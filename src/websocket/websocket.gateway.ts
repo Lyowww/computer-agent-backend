@@ -121,6 +121,9 @@ export class AppWebsocketGateway
         socket.data.userId = payload.sub;
         socket.data.channel = 'web-client';
         this.logger.log(`web-client connected user=${payload.sub}`);
+        // Bind handlers on the live socket. Nest @SubscribeMessage + Socket.IO
+        // ack callbacks have been unreliable for web→device command delivery.
+        this.bindWebClientHandlers(socket);
         return;
       }
 
@@ -371,13 +374,9 @@ export class AppWebsocketGateway
     return { ok: true };
   }
 
-  // -------- web-client events --------
+  // -------- web-client events (also bound via bindWebClientHandlers) --------
 
-  @SubscribeMessage(WsEvent.CAPTURE_SCREEN)
-  async onCaptureScreen(
-    @ConnectedSocket() socket: Socket,
-    @MessageBody() body: unknown,
-  ) {
+  async onCaptureScreen(socket: Socket, body: unknown) {
     if (socket.data.channel !== 'web-client' || !socket.data.userId) {
       return this.fail(socket, 'FORBIDDEN', 'CAPTURE_SCREEN only for web-client');
     }
@@ -399,8 +398,6 @@ export class AppWebsocketGateway
         quality: parsed.data.quality,
         deviceId: parsed.data.deviceId,
       });
-      // Explicit event ACK as well as Nest return-value ACK (more reliable across Nest/Socket.IO).
-      socket.emit('REQUEST_ACK', { event: WsEvent.CAPTURE_SCREEN, ok: true, ...result });
       return { ok: true, ...result };
     } catch (err) {
       this.logger.warn(
@@ -416,11 +413,7 @@ export class AppWebsocketGateway
     }
   }
 
-  @SubscribeMessage(WsEvent.USER_MESSAGE)
-  async onUserMessage(
-    @ConnectedSocket() socket: Socket,
-    @MessageBody() body: unknown,
-  ) {
+  async onUserMessage(socket: Socket, body: unknown) {
     if (socket.data.channel !== 'web-client' || !socket.data.userId) {
       return this.fail(socket, 'FORBIDDEN', 'USER_MESSAGE only for web-client');
     }
@@ -434,6 +427,9 @@ export class AppWebsocketGateway
     }
 
     try {
+      this.logger.log(
+        `USER_MESSAGE from user=${socket.data.userId} useAi=${parsed.data.useAi !== false} device=${parsed.data.deviceId ?? 'auto'}`,
+      );
       const result = await this.tasks.handleUserMessage(socket.data.userId, parsed.data);
       return { requestId: parsed.data.requestId, ...result };
     } catch (err) {
@@ -447,11 +443,7 @@ export class AppWebsocketGateway
     }
   }
 
-  @SubscribeMessage(WsEvent.NOTIFY)
-  async onNotify(
-    @ConnectedSocket() socket: Socket,
-    @MessageBody() body: unknown,
-  ) {
+  async onNotify(socket: Socket, body: unknown) {
     if (socket.data.channel !== 'web-client' || !socket.data.userId) {
       return this.fail(socket, 'FORBIDDEN', 'NOTIFY only for web-client');
     }
@@ -463,8 +455,10 @@ export class AppWebsocketGateway
       return this.fail(socket, 'VALIDATION_ERROR', 'Invalid NOTIFY', parsed.error.issues);
     }
     try {
+      this.logger.log(
+        `NOTIFY from user=${socket.data.userId} device=${parsed.data.deviceId ?? 'auto'} requestId=${parsed.data.requestId}`,
+      );
       const result = await this.tasks.notifyDevice(socket.data.userId, parsed.data);
-      socket.emit('REQUEST_ACK', { event: WsEvent.NOTIFY, ok: true, ...result });
       return { ok: true, ...result };
     } catch (err) {
       return this.fail(
@@ -477,11 +471,7 @@ export class AppWebsocketGateway
     }
   }
 
-  @SubscribeMessage(WsEvent.LIST_PROCESSES)
-  async onListProcesses(
-    @ConnectedSocket() socket: Socket,
-    @MessageBody() body: unknown,
-  ) {
+  async onListProcesses(socket: Socket, body: unknown) {
     if (socket.data.channel !== 'web-client' || !socket.data.userId) {
       return this.fail(socket, 'FORBIDDEN', 'LIST_PROCESSES only for web-client');
     }
@@ -510,11 +500,7 @@ export class AppWebsocketGateway
     }
   }
 
-  @SubscribeMessage(WsEvent.LIST_APPS)
-  async onListApps(
-    @ConnectedSocket() socket: Socket,
-    @MessageBody() body: unknown,
-  ) {
+  async onListApps(socket: Socket, body: unknown) {
     if (socket.data.channel !== 'web-client' || !socket.data.userId) {
       return this.fail(socket, 'FORBIDDEN', 'LIST_APPS only for web-client');
     }
@@ -617,6 +603,55 @@ export class AppWebsocketGateway
       default:
         return this.fail(socket, 'UNKNOWN_EVENT', `Unknown event: ${body.event}`);
     }
+  }
+
+  /**
+   * Attach native Socket.IO listeners for dashboard commands.
+   * Prefer this over Nest @SubscribeMessage for web-client — more reliable delivery.
+   */
+  private bindWebClientHandlers(socket: Socket): void {
+    socket.onAny((event: string) => {
+      if (event === 'message' || event === 'error') return;
+      this.logger.log(`web inbound event=${event} socket=${socket.id}`);
+    });
+
+    const bind = (
+      event: string,
+      handler: (socket: Socket, body: unknown) => Promise<unknown>,
+    ) => {
+      socket.on(event, (body: unknown) => {
+        void (async () => {
+          try {
+            const result = (await handler.call(this, socket, body)) as
+              | { ok?: boolean; requestId?: string }
+              | undefined;
+            if (result && result.ok === false) {
+              return;
+            }
+            socket.emit('REQUEST_ACK', {
+              event,
+              ok: true,
+              ...(result && typeof result === 'object' ? result : {}),
+            });
+          } catch (err) {
+            this.logger.warn(
+              `web handler ${event} threw: ${err instanceof Error ? err.message : err}`,
+            );
+            this.fail(
+              socket,
+              'HANDLER_ERROR',
+              err instanceof Error ? err.message : String(err),
+            );
+          }
+        })();
+      });
+    };
+
+    bind(WsEvent.CAPTURE_SCREEN, this.onCaptureScreen);
+    bind(WsEvent.USER_MESSAGE, this.onUserMessage);
+    bind(WsEvent.NOTIFY, this.onNotify);
+    bind(WsEvent.LIST_PROCESSES, this.onListProcesses);
+    bind(WsEvent.LIST_APPS, this.onListApps);
   }
 
   private requireAgent(socket: Socket): boolean {
