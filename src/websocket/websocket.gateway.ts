@@ -65,6 +65,8 @@ export class AppWebsocketGateway
 {
   private readonly logger = new Logger(AppWebsocketGateway.name);
   private heartbeatTimer?: NodeJS.Timeout;
+  /** Prevents double-handling when both Nest @SubscribeMessage and bindWebClientHandlers fire. */
+  private readonly inFlightRequests = new Set<string>();
 
   @WebSocketServer()
   server!: Server;
@@ -154,13 +156,21 @@ export class AppWebsocketGateway
     const client = this.connections.unregister(socket.id);
     if (client?.deviceId) {
       await this.sessions.endBySocketId(socket.id);
-      const device = await this.devices.markOffline(client.deviceId);
-      if (device && client.userId) {
-        this.connections.sendToUser(client.userId, WsEvent.DEVICE_STATUS, {
-          deviceId: device.id,
-          connectionStatus: device.connectionStatus,
-          lastSeenAt: device.lastSeenAt,
-        });
+      // Reconnect race: a newer socket may already be registered for this device.
+      // Only mark OFFLINE when no live agent socket remains.
+      if (!this.connections.isDeviceOnline(client.deviceId)) {
+        const device = await this.devices.markOffline(client.deviceId);
+        if (device && client.userId) {
+          this.connections.sendToUser(client.userId, WsEvent.DEVICE_STATUS, {
+            deviceId: device.id,
+            connectionStatus: device.connectionStatus,
+            lastSeenAt: device.lastSeenAt,
+          });
+        }
+      } else {
+        this.logger.log(
+          `Skip markOffline — device=${client.deviceId} still has a live socket after ${socket.id} disconnected`,
+        );
       }
       await this.prisma.agentEvent.create({
         data: {
@@ -374,7 +384,47 @@ export class AppWebsocketGateway
     return { ok: true };
   }
 
-  // -------- web-client events (also bound via bindWebClientHandlers) --------
+  // -------- web-client events (Nest + bindWebClientHandlers; deduped by requestId) --------
+
+  @SubscribeMessage(WsEvent.CAPTURE_SCREEN)
+  async onCaptureScreenSubscribe(
+    @ConnectedSocket() socket: Socket,
+    @MessageBody() body: unknown,
+  ) {
+    return this.onCaptureScreen(socket, body);
+  }
+
+  @SubscribeMessage(WsEvent.USER_MESSAGE)
+  async onUserMessageSubscribe(
+    @ConnectedSocket() socket: Socket,
+    @MessageBody() body: unknown,
+  ) {
+    return this.onUserMessage(socket, body);
+  }
+
+  @SubscribeMessage(WsEvent.NOTIFY)
+  async onNotifySubscribe(
+    @ConnectedSocket() socket: Socket,
+    @MessageBody() body: unknown,
+  ) {
+    return this.onNotify(socket, body);
+  }
+
+  @SubscribeMessage(WsEvent.LIST_PROCESSES)
+  async onListProcessesSubscribe(
+    @ConnectedSocket() socket: Socket,
+    @MessageBody() body: unknown,
+  ) {
+    return this.onListProcesses(socket, body);
+  }
+
+  @SubscribeMessage(WsEvent.LIST_APPS)
+  async onListAppsSubscribe(
+    @ConnectedSocket() socket: Socket,
+    @MessageBody() body: unknown,
+  ) {
+    return this.onListApps(socket, body);
+  }
 
   async onCaptureScreen(socket: Socket, body: unknown) {
     if (socket.data.channel !== 'web-client' || !socket.data.userId) {
@@ -387,6 +437,11 @@ export class AppWebsocketGateway
     const parsed = captureScreenSchema.safeParse(body);
     if (!parsed.success) {
       return this.fail(socket, 'VALIDATION_ERROR', 'Invalid CAPTURE_SCREEN', parsed.error.issues);
+    }
+
+    const gate = this.beginRequest(`capture:${parsed.data.requestId}`);
+    if (!gate) {
+      return { ok: true, deduped: true, requestId: parsed.data.requestId };
     }
 
     try {
@@ -410,6 +465,8 @@ export class AppWebsocketGateway
         undefined,
         parsed.data.requestId,
       );
+    } finally {
+      gate.release();
     }
   }
 
@@ -426,12 +483,20 @@ export class AppWebsocketGateway
       return this.fail(socket, 'VALIDATION_ERROR', 'Invalid USER_MESSAGE', parsed.error.issues);
     }
 
+    const dedupeKey = parsed.data.requestId
+      ? `user_message:${parsed.data.requestId}`
+      : `user_message:${socket.id}:${Date.now()}`;
+    const gate = this.beginRequest(dedupeKey);
+    if (!gate) {
+      return { ok: true, deduped: true, requestId: parsed.data.requestId };
+    }
+
     try {
       this.logger.log(
         `USER_MESSAGE from user=${socket.data.userId} useAi=${parsed.data.useAi !== false} device=${parsed.data.deviceId ?? 'auto'}`,
       );
       const result = await this.tasks.handleUserMessage(socket.data.userId, parsed.data);
-      return { requestId: parsed.data.requestId, ...result };
+      return { requestId: parsed.data.requestId, ...result, ok: true };
     } catch (err) {
       return this.fail(
         socket,
@@ -440,6 +505,8 @@ export class AppWebsocketGateway
         undefined,
         parsed.data.requestId,
       );
+    } finally {
+      gate.release();
     }
   }
 
@@ -453,6 +520,10 @@ export class AppWebsocketGateway
     const parsed = notifySchema.safeParse(body);
     if (!parsed.success) {
       return this.fail(socket, 'VALIDATION_ERROR', 'Invalid NOTIFY', parsed.error.issues);
+    }
+    const gate = this.beginRequest(`notify:${parsed.data.requestId}`);
+    if (!gate) {
+      return { ok: true, deduped: true, requestId: parsed.data.requestId };
     }
     try {
       this.logger.log(
@@ -468,6 +539,8 @@ export class AppWebsocketGateway
         undefined,
         parsed.data.requestId,
       );
+    } finally {
+      gate.release();
     }
   }
 
@@ -481,6 +554,10 @@ export class AppWebsocketGateway
     const parsed = listQuerySchema.safeParse(body);
     if (!parsed.success) {
       return this.fail(socket, 'VALIDATION_ERROR', 'Invalid LIST_PROCESSES', parsed.error.issues);
+    }
+    const gate = this.beginRequest(`list_processes:${parsed.data.requestId}`);
+    if (!gate) {
+      return { ok: true, deduped: true, requestId: parsed.data.requestId };
     }
     try {
       const result = await this.tasks.requestDeviceList(
@@ -497,6 +574,8 @@ export class AppWebsocketGateway
         undefined,
         parsed.data.requestId,
       );
+    } finally {
+      gate.release();
     }
   }
 
@@ -510,6 +589,10 @@ export class AppWebsocketGateway
     const parsed = listQuerySchema.safeParse(body);
     if (!parsed.success) {
       return this.fail(socket, 'VALIDATION_ERROR', 'Invalid LIST_APPS', parsed.error.issues);
+    }
+    const gate = this.beginRequest(`list_apps:${parsed.data.requestId}`);
+    if (!gate) {
+      return { ok: true, deduped: true, requestId: parsed.data.requestId };
     }
     try {
       const result = await this.tasks.requestDeviceList(
@@ -526,6 +609,8 @@ export class AppWebsocketGateway
         undefined,
         parsed.data.requestId,
       );
+    } finally {
+      gate.release();
     }
   }
 
@@ -608,6 +693,7 @@ export class AppWebsocketGateway
   /**
    * Attach native Socket.IO listeners for dashboard commands.
    * Prefer this over Nest @SubscribeMessage for web-client — more reliable delivery.
+   * Nest @SubscribeMessage is also registered; beginRequest() dedupes double delivery.
    */
   private bindWebClientHandlers(socket: Socket): void {
     socket.onAny((event: string) => {
@@ -620,6 +706,19 @@ export class AppWebsocketGateway
       handler: (socket: Socket, body: unknown) => Promise<unknown>,
     ) => {
       socket.on(event, (body: unknown) => {
+        // Immediate ack so the dashboard knows the backend received the command,
+        // even if device forwarding or AI work takes longer.
+        const requestId =
+          body && typeof body === 'object' && 'requestId' in body
+            ? String((body as { requestId?: unknown }).requestId ?? '')
+            : undefined;
+        socket.emit('REQUEST_ACK', {
+          event,
+          ok: true,
+          phase: 'received',
+          ...(requestId ? { requestId } : {}),
+        });
+
         void (async () => {
           try {
             const result = (await handler.call(this, socket, body)) as
@@ -631,6 +730,7 @@ export class AppWebsocketGateway
             socket.emit('REQUEST_ACK', {
               event,
               ok: true,
+              phase: 'forwarded',
               ...(result && typeof result === 'object' ? result : {}),
             });
           } catch (err) {
@@ -652,6 +752,20 @@ export class AppWebsocketGateway
     bind(WsEvent.NOTIFY, this.onNotify);
     bind(WsEvent.LIST_PROCESSES, this.onListProcesses);
     bind(WsEvent.LIST_APPS, this.onListApps);
+  }
+
+  /** @returns release handle, or null if this requestId is already in flight */
+  private beginRequest(key: string): { release: () => void } | null {
+    if (this.inFlightRequests.has(key)) {
+      this.logger.log(`Deduped inbound request key=${key}`);
+      return null;
+    }
+    this.inFlightRequests.add(key);
+    return {
+      release: () => {
+        this.inFlightRequests.delete(key);
+      },
+    };
   }
 
   private requireAgent(socket: Socket): boolean {

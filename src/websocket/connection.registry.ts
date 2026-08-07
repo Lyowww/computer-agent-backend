@@ -43,7 +43,9 @@ export class ConnectionRegistry {
     this.bySocket.set(socket.id, client);
     this.socketRefs.set(socket.id, socket);
 
-    if (meta.userId) {
+    // Only web clients join the user room — desktop agents must not receive
+    // dashboard fanout (DEVICE_STATUS, SCREEN_RESULT, etc.).
+    if (meta.userId && meta.channel === 'web-client') {
       const set = this.userSockets.get(meta.userId) ?? new Set();
       set.add(socket.id);
       this.userSockets.set(meta.userId, set);
@@ -67,7 +69,7 @@ export class ConnectionRegistry {
     this.bySocket.delete(socketId);
     this.socketRefs.delete(socketId);
 
-    if (client.userId) {
+    if (client.userId && client.channel === 'web-client') {
       const set = this.userSockets.get(client.userId);
       set?.delete(socketId);
       if (set && set.size === 0) this.userSockets.delete(client.userId);
