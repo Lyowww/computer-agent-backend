@@ -9,6 +9,7 @@ import {
 import { ConfigService } from '@nestjs/config';
 import Redis from 'ioredis';
 import type { AppConfig } from '../../config/configuration';
+import { PendingStore } from '../pending/pending.store';
 
 export const REDIS_CLIENT = Symbol('REDIS_CLIENT');
 
@@ -124,7 +125,8 @@ export class RedisService implements OnModuleDestroy {
       },
     },
     RedisService,
+    PendingStore,
   ],
-  exports: [RedisService, REDIS_CLIENT],
+  exports: [RedisService, REDIS_CLIENT, PendingStore],
 })
 export class RedisModule {}

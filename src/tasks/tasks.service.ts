@@ -13,7 +13,7 @@ import { ActionsService } from '../actions/actions.service';
 import { AiService } from '../ai/ai.service';
 import { ScreenshotsService } from '../screenshots/screenshots.service';
 import { ConnectionRegistry } from '../websocket/connection.registry';
-import { RedisService } from '../common/redis/redis.module';
+import { PendingStore } from '../common/pending/pending.store';
 import { assertOwnership } from '../common/guards/auth.guards';
 import type { CreateTaskDto } from '../common/validation/schemas';
 import type { AppConfig } from '../config/configuration';
@@ -30,7 +30,7 @@ export class TasksService {
     private readonly ai: AiService,
     private readonly screenshots: ScreenshotsService,
     private readonly connections: ConnectionRegistry,
-    private readonly redis: RedisService,
+    private readonly pending: PendingStore,
     private readonly config: ConfigService,
   ) {}
 
@@ -97,7 +97,7 @@ export class TasksService {
     }
 
     const requestId = `req_${uuidv4()}`;
-    await this.redis.set(`screen-pending:${requestId}`, taskId, 120);
+    this.pending.set(`screen-pending:${requestId}`, taskId, 120);
     await this.updateStatus(taskId, TaskStatus.WAITING_FOR_SCREEN);
 
     const sent = this.connections.requestScreenshot(
@@ -106,30 +106,35 @@ export class TasksService {
       taskId,
     );
     if (!sent) {
-      await this.redis.del(`screen-pending:${requestId}`);
+      this.pending.del(`screen-pending:${requestId}`);
       await this.failTask(taskId, 'Device is not connected');
     }
   }
 
   async handleScreenResult(payload: ScreenResultPayload): Promise<void> {
     if (!payload.error && payload.image) {
-      await this.screenshots.storeEphemeral(payload);
+      // Best-effort ephemeral cache — never block delivery on Redis.
+      void this.screenshots.storeEphemeral(payload).catch((err) => {
+        this.logger.warn(
+          `Screenshot cache failed: ${err instanceof Error ? err.message : err}`,
+        );
+      });
     }
 
     let taskId = payload.taskId ?? null;
     if (!taskId) {
-      taskId = await this.redis.get(`screen-pending:${payload.requestId}`);
+      taskId = this.pending.get(`screen-pending:${payload.requestId}`);
     }
     if (taskId) {
-      await this.redis.del(`screen-pending:${payload.requestId}`);
+      this.pending.del(`screen-pending:${payload.requestId}`);
     }
 
     // Standalone user capture (dashboard / chat screenshot) — deliver even if taskId is set.
-    const captureUserId = await this.redis.get(
+    const captureUserId = this.pending.get(
       `capture-user:${payload.requestId}`,
     );
     if (captureUserId) {
-      await this.redis.del(`capture-user:${payload.requestId}`);
+      this.pending.del(`capture-user:${payload.requestId}`);
       this.connections.sendToUser(captureUserId, 'SCREEN_RESULT', {
         requestId: payload.requestId,
         taskId: payload.taskId,
@@ -141,7 +146,7 @@ export class TasksService {
       });
       const app = this.config.get<AppConfig>('app')!;
       if (!app.STORE_SCREENSHOTS && payload.image) {
-        await this.screenshots.discard(payload.requestId);
+        void this.screenshots.discard(payload.requestId);
       }
       if (!taskId || payload.error) {
         return;
@@ -191,7 +196,7 @@ export class TasksService {
     }
 
     const requestId = opts.requestId ?? `req_${uuidv4()}`;
-    await this.redis.set(`capture-user:${requestId}`, userId, 120);
+    this.pending.set(`capture-user:${requestId}`, userId, 120);
 
     const sent = this.connections.sendToDevice(device.id, 'CAPTURE_SCREEN', {
       requestId,
@@ -200,7 +205,7 @@ export class TasksService {
       deviceId: device.id,
     });
     if (!sent) {
-      await this.redis.del(`capture-user:${requestId}`);
+      this.pending.del(`capture-user:${requestId}`);
       throw new BadRequestException('Failed to reach device');
     }
 
@@ -227,7 +232,7 @@ export class TasksService {
     }
 
     // Forward to the agent first so UI ACK is not blocked by DB writes.
-    await this.redis.set(`notify-user:${input.requestId}`, userId, 120);
+    this.pending.set(`notify-user:${input.requestId}`, userId, 120);
     const sent = this.connections.sendToDevice(device.id, 'NOTIFY', {
       requestId: input.requestId,
       title: input.title ?? 'Message from dashboard',
@@ -235,7 +240,7 @@ export class TasksService {
       from: input.from ?? 'dashboard',
     });
     if (!sent) {
-      await this.redis.del(`notify-user:${input.requestId}`);
+      this.pending.del(`notify-user:${input.requestId}`);
       throw new BadRequestException('Failed to reach device');
     }
 
@@ -271,7 +276,7 @@ export class TasksService {
       throw new BadRequestException('Device is not connected via WebSocket');
     }
 
-    await this.redis.set(
+    this.pending.set(
       `${kind.toLowerCase()}-user:${input.requestId}`,
       userId,
       120,
@@ -517,15 +522,22 @@ export class TasksService {
   ) {
     const useAi = input.useAi !== false;
 
-    await this.prisma.chatMessage.create({
-      data: {
-        userId,
-        taskId: input.taskId,
-        role: MessageRole.USER,
-        content: input.content,
-        metadata: { useAi },
-      },
-    });
+    // Persist chat off the ACK path so Redis/DB latency cannot time out the web client.
+    void this.prisma.chatMessage
+      .create({
+        data: {
+          userId,
+          taskId: input.taskId,
+          role: MessageRole.USER,
+          content: input.content,
+          metadata: { useAi },
+        },
+      })
+      .catch((err) => {
+        this.logger.warn(
+          `Failed to persist chat message: ${err instanceof Error ? err.message : err}`,
+        );
+      });
 
     // Notify-only path: no AI planning / no task loop
     if (!useAi) {

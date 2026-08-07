@@ -32,6 +32,12 @@ export class JwtAuthGuard extends AuthGuard('jwt') {
   }
 
   canActivate(context: ExecutionContext) {
+    // WebSocket auth is handled in the gateway handshake / REGISTER_DEVICE.
+    // Applying Passport JWT here leaves Socket.IO ACKs hanging → client "operation has timed out".
+    if (context.getType() !== 'http') {
+      return true;
+    }
+
     const isPublic = this.reflector.getAllAndOverride<boolean>(IS_PUBLIC_KEY, [
       context.getHandler(),
       context.getClass(),

@@ -22,7 +22,8 @@ import { DevicesService } from '../devices/devices.service';
 import { SessionsService } from '../sessions/sessions.service';
 import { TasksService } from '../tasks/tasks.service';
 import { PrismaService } from '../database/prisma.service';
-import { RedisService } from '../common/redis/redis.module';
+import { PendingStore } from '../common/pending/pending.store';
+import { Public } from '../common/guards/auth.guards';
 import { WsEvent } from '../common/events/ws-events';
 import {
   actionResultSchema,
@@ -51,6 +52,7 @@ function extractBearer(socket: Socket): string | null {
   return null;
 }
 
+@Public()
 @WebSocketGateway({
   cors: { origin: true, credentials: true },
   namespace: '/ws',
@@ -75,7 +77,7 @@ export class AppWebsocketGateway
     private readonly sessions: SessionsService,
     private readonly tasks: TasksService,
     private readonly prisma: PrismaService,
-    private readonly redis: RedisService,
+    private readonly pending: PendingStore,
   ) {}
 
   afterInit(server: Server): void {
@@ -319,10 +321,10 @@ export class AppWebsocketGateway
     if (!parsed.success) {
       return this.fail(socket, 'VALIDATION_ERROR', 'Invalid NOTIFY_RESULT', parsed.error.issues);
     }
-    const userId = await this.redis.get(`notify-user:${parsed.data.requestId}`);
+    const userId = this.pending.get(`notify-user:${parsed.data.requestId}`);
     if (userId) {
       this.connections.sendToUser(userId, WsEvent.NOTIFY_RESULT, parsed.data);
-      await this.redis.del(`notify-user:${parsed.data.requestId}`);
+      this.pending.del(`notify-user:${parsed.data.requestId}`);
     }
     return { ok: true };
   }
@@ -339,12 +341,12 @@ export class AppWebsocketGateway
     if (!parsed.success) {
       return this.fail(socket, 'VALIDATION_ERROR', 'Invalid PROCESSES_RESULT', parsed.error.issues);
     }
-    const userId = await this.redis.get(
+    const userId = this.pending.get(
       `list_processes-user:${parsed.data.requestId}`,
     );
     if (userId) {
       this.connections.sendToUser(userId, WsEvent.PROCESSES_RESULT, parsed.data);
-      await this.redis.del(`list_processes-user:${parsed.data.requestId}`);
+      this.pending.del(`list_processes-user:${parsed.data.requestId}`);
     }
     return { ok: true };
   }
@@ -361,10 +363,10 @@ export class AppWebsocketGateway
     if (!parsed.success) {
       return this.fail(socket, 'VALIDATION_ERROR', 'Invalid APPS_RESULT', parsed.error.issues);
     }
-    const userId = await this.redis.get(`list_apps-user:${parsed.data.requestId}`);
+    const userId = this.pending.get(`list_apps-user:${parsed.data.requestId}`);
     if (userId) {
       this.connections.sendToUser(userId, WsEvent.APPS_RESULT, parsed.data);
-      await this.redis.del(`list_apps-user:${parsed.data.requestId}`);
+      this.pending.del(`list_apps-user:${parsed.data.requestId}`);
     }
     return { ok: true };
   }
@@ -543,7 +545,7 @@ export class AppWebsocketGateway
     const payload = parsed.success ? parsed.data : {};
 
     if (payload.nonce) {
-      const claimed = await this.redis.claimNonce(payload.nonce, 120);
+      const claimed = this.pending.claimNonce(payload.nonce, 120);
       if (!claimed) {
         return this.fail(socket, 'REPLAY', 'Nonce already used', undefined, payload.requestId);
       }
@@ -619,7 +621,7 @@ export class AppWebsocketGateway
   private async rateLimit(socket: Socket): Promise<boolean> {
     const app = this.config.get<AppConfig>('app')!;
     const key = socket.data.deviceId || socket.data.userId || socket.id;
-    return this.redis.checkRateLimit(
+    return this.pending.checkRateLimit(
       `ws:${key}`,
       app.WS_RATE_LIMIT_MAX,
       app.RATE_LIMIT_TTL_MS,
