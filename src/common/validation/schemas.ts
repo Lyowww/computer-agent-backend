@@ -151,6 +151,8 @@ export const actionTypeSchema = z.enum([
   'MOVE',
   'DRAG',
   'WAIT',
+  'LOCK_SCREEN',
+  'UNLOCK_SCREEN',
   'DONE',
   'FAIL',
 ]);

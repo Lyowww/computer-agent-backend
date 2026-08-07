@@ -196,7 +196,7 @@ Expected response (validated with Zod):
 }
 ```
 
-Allowed action types: `CLICK`, `DOUBLE_CLICK`, `RIGHT_CLICK`, `TYPE`, `KEY`, `SCROLL`, `MOVE`, `DRAG`, `WAIT`, `DONE`, `FAIL`.
+Allowed action types: `CLICK`, `DOUBLE_CLICK`, `RIGHT_CLICK`, `TYPE`, `KEY`, `SCROLL`, `MOVE`, `DRAG`, `WAIT`, `LOCK_SCREEN`, `UNLOCK_SCREEN`, `DONE`, `FAIL`.
 
 The backend **never** executes computer actions and **never** accepts arbitrary shell/exec commands from clients or AI responses.
 
