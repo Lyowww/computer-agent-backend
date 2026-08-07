@@ -294,6 +294,34 @@ export class TasksService {
     return { requestId: input.requestId, deviceId: device.id };
   }
 
+  async requestAppAction(
+    userId: string,
+    action: 'OPEN_APP' | 'CLOSE_APP',
+    input: { requestId: string; app: string; deviceId?: string },
+  ) {
+    const device = await this.devices.getActiveDeviceForUser(
+      userId,
+      input.deviceId,
+    );
+    if (!this.connections.isDeviceOnline(device.id)) {
+      throw new BadRequestException('Device is not connected via WebSocket');
+    }
+
+    this.pending.set(`app_action-user:${input.requestId}`, userId, 120);
+    const sent = this.connections.sendToDevice(device.id, action, {
+      requestId: input.requestId,
+      app: input.app,
+    });
+    if (!sent) {
+      this.pending.del(`app_action-user:${input.requestId}`);
+      throw new BadRequestException('Failed to reach device');
+    }
+    this.logger.log(
+      `${action} forwarded to device=${device.id} app=${input.app} requestId=${input.requestId}`,
+    );
+    return { requestId: input.requestId, deviceId: device.id, app: input.app };
+  }
+
   private async runAiIteration(
     taskId: string,
     screen: ScreenResultPayload,

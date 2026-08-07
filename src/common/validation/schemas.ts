@@ -92,6 +92,24 @@ export const notifyResultSchema = z.object({
   error: z.string().max(2000).optional(),
 });
 
+export const appActionSchema = z.object({
+  requestId: z.string().min(1).max(64),
+  app: z
+    .string()
+    .min(1)
+    .max(256)
+    .regex(/^[A-Za-z0-9][A-Za-z0-9 _.'()-]*$/, 'Invalid application name'),
+  deviceId: z.string().uuid().optional(),
+});
+
+export const appActionResultSchema = z.object({
+  requestId: z.string().min(1).max(64),
+  action: z.enum(['open', 'close']),
+  app: z.string().min(1).max(256),
+  success: z.boolean(),
+  error: z.string().max(2000).optional(),
+});
+
 export const pingSchema = z.object({
   requestId: z.string().min(1).max(64).optional(),
   nonce: z.string().min(8).max(128).optional(),

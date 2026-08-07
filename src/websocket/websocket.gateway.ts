@@ -27,6 +27,8 @@ import { Public } from '../common/guards/auth.guards';
 import { WsEvent } from '../common/events/ws-events';
 import {
   actionResultSchema,
+  appActionResultSchema,
+  appActionSchema,
   appsResultSchema,
   captureScreenSchema,
   listQuerySchema,
@@ -384,6 +386,26 @@ export class AppWebsocketGateway
     return { ok: true };
   }
 
+  @SubscribeMessage(WsEvent.APP_ACTION_RESULT)
+  async onAppActionResult(
+    @ConnectedSocket() socket: Socket,
+    @MessageBody() body: unknown,
+  ) {
+    if (!this.requireAgent(socket)) {
+      return this.fail(socket, 'UNAUTHORIZED', 'Device not registered');
+    }
+    const parsed = appActionResultSchema.safeParse(body);
+    if (!parsed.success) {
+      return this.fail(socket, 'VALIDATION_ERROR', 'Invalid APP_ACTION_RESULT', parsed.error.issues);
+    }
+    const userId = this.pending.get(`app_action-user:${parsed.data.requestId}`);
+    if (userId) {
+      this.connections.sendToUser(userId, WsEvent.APP_ACTION_RESULT, parsed.data);
+      this.pending.del(`app_action-user:${parsed.data.requestId}`);
+    }
+    return { ok: true };
+  }
+
   // -------- web-client events (Nest + bindWebClientHandlers; deduped by requestId) --------
 
   @SubscribeMessage(WsEvent.CAPTURE_SCREEN)
@@ -424,6 +446,22 @@ export class AppWebsocketGateway
     @MessageBody() body: unknown,
   ) {
     return this.onListApps(socket, body);
+  }
+
+  @SubscribeMessage(WsEvent.OPEN_APP)
+  async onOpenAppSubscribe(
+    @ConnectedSocket() socket: Socket,
+    @MessageBody() body: unknown,
+  ) {
+    return this.onOpenApp(socket, body);
+  }
+
+  @SubscribeMessage(WsEvent.CLOSE_APP)
+  async onCloseAppSubscribe(
+    @ConnectedSocket() socket: Socket,
+    @MessageBody() body: unknown,
+  ) {
+    return this.onCloseApp(socket, body);
   }
 
   async onCaptureScreen(socket: Socket, body: unknown) {
@@ -614,6 +652,53 @@ export class AppWebsocketGateway
     }
   }
 
+  async onOpenApp(socket: Socket, body: unknown) {
+    return this.handleAppAction(socket, body, 'OPEN_APP');
+  }
+
+  async onCloseApp(socket: Socket, body: unknown) {
+    return this.handleAppAction(socket, body, 'CLOSE_APP');
+  }
+
+  private async handleAppAction(
+    socket: Socket,
+    body: unknown,
+    action: 'OPEN_APP' | 'CLOSE_APP',
+  ) {
+    if (socket.data.channel !== 'web-client' || !socket.data.userId) {
+      return this.fail(socket, 'FORBIDDEN', `${action} only for web-client`);
+    }
+    if (!(await this.rateLimit(socket))) {
+      return this.fail(socket, 'RATE_LIMITED', 'Too many messages');
+    }
+    const parsed = appActionSchema.safeParse(body);
+    if (!parsed.success) {
+      return this.fail(socket, 'VALIDATION_ERROR', `Invalid ${action}`, parsed.error.issues);
+    }
+    const gate = this.beginRequest(`app_action:${parsed.data.requestId}`);
+    if (!gate) {
+      return { ok: true, deduped: true, requestId: parsed.data.requestId };
+    }
+    try {
+      const result = await this.tasks.requestAppAction(
+        socket.data.userId,
+        action,
+        parsed.data,
+      );
+      return { ok: true, ...result };
+    } catch (err) {
+      return this.fail(
+        socket,
+        'APP_ACTION_FAILED',
+        err instanceof Error ? err.message : `${action} failed`,
+        undefined,
+        parsed.data.requestId,
+      );
+    } finally {
+      gate.release();
+    }
+  }
+
   // -------- shared --------
 
   @SubscribeMessage(WsEvent.PING)
@@ -671,6 +756,8 @@ export class AppWebsocketGateway
         return this.onProcessesResult(socket, body.payload);
       case WsEvent.APPS_RESULT:
         return this.onAppsResult(socket, body.payload);
+      case WsEvent.APP_ACTION_RESULT:
+        return this.onAppActionResult(socket, body.payload);
       case WsEvent.CAPTURE_SCREEN:
         return this.onCaptureScreen(socket, body.payload);
       case WsEvent.USER_MESSAGE:
@@ -681,6 +768,10 @@ export class AppWebsocketGateway
         return this.onListProcesses(socket, body.payload);
       case WsEvent.LIST_APPS:
         return this.onListApps(socket, body.payload);
+      case WsEvent.OPEN_APP:
+        return this.onOpenApp(socket, body.payload);
+      case WsEvent.CLOSE_APP:
+        return this.onCloseApp(socket, body.payload);
       case WsEvent.PING:
         return this.onPing(socket, body.payload);
       case WsEvent.PONG:
@@ -752,6 +843,8 @@ export class AppWebsocketGateway
     bind(WsEvent.NOTIFY, this.onNotify);
     bind(WsEvent.LIST_PROCESSES, this.onListProcesses);
     bind(WsEvent.LIST_APPS, this.onListApps);
+    bind(WsEvent.OPEN_APP, this.onOpenApp);
+    bind(WsEvent.CLOSE_APP, this.onCloseApp);
   }
 
   /** @returns release handle, or null if this requestId is already in flight */
