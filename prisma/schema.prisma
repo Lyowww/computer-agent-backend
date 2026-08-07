@@ -1,0 +1,195 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum DeviceOs {
+  darwin
+  win32
+  linux
+}
+
+enum ConnectionStatus {
+  ONLINE
+  OFFLINE
+  REVOKED
+}
+
+enum TaskStatus {
+  CREATED
+  RUNNING
+  WAITING_FOR_SCREEN
+  WAITING_FOR_ACTION
+  WAITING_FOR_USER
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+enum ActionType {
+  CLICK
+  DOUBLE_CLICK
+  RIGHT_CLICK
+  TYPE
+  KEY
+  SCROLL
+  MOVE
+  DRAG
+  WAIT
+  DONE
+  FAIL
+}
+
+enum ActionStatus {
+  PENDING
+  SENT
+  SUCCEEDED
+  FAILED
+  SKIPPED
+}
+
+enum MessageRole {
+  USER
+  ASSISTANT
+  SYSTEM
+}
+
+enum AgentEventType {
+  CONNECT
+  DISCONNECT
+  REGISTER
+  STATUS
+  SCREEN
+  ACTION
+  ERROR
+  PING
+  OTHER
+}
+
+model User {
+  id           String         @id @default(uuid())
+  email        String         @unique
+  passwordHash String
+  name         String?
+  createdAt    DateTime       @default(now())
+  updatedAt    DateTime       @updatedAt
+  devices      Device[]
+  tasks        Task[]
+  chatMessages ChatMessage[]
+  sessions     DeviceSession[]
+}
+
+model Device {
+  id               String           @id @default(uuid())
+  userId           String
+  user             User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name             String
+  os               DeviceOs
+  /// Hashed device auth token — never expose plaintext after provisioning
+  tokenHash        String
+  /// Token prefix for lookup without storing full token
+  tokenPrefix      String
+  connectionStatus ConnectionStatus @default(OFFLINE)
+  lastSeenAt       DateTime?
+  revokedAt        DateTime?
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+  sessions         DeviceSession[]
+  tasks            Task[]
+  agentEvents      AgentEvent[]
+
+  @@index([userId])
+  @@index([tokenPrefix])
+  @@index([connectionStatus])
+}
+
+model DeviceSession {
+  id             String    @id @default(uuid())
+  deviceId       String
+  device         Device    @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  userId         String
+  user           User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  socketId       String?
+  connectedAt    DateTime  @default(now())
+  disconnectedAt DateTime?
+  ipAddress      String?
+  userAgent      String?
+  isActive       Boolean   @default(true)
+
+  @@index([deviceId, isActive])
+  @@index([userId])
+}
+
+model Task {
+  id              String        @id @default(uuid())
+  userId          String
+  user            User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  deviceId        String
+  device          Device        @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  instruction     String
+  status          TaskStatus    @default(CREATED)
+  iteration       Int           @default(0)
+  maxIterations   Int           @default(50)
+  errorMessage    String?
+  resultSummary   String?
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+  completedAt     DateTime?
+  actions         TaskAction[]
+  chatMessages    ChatMessage[]
+
+  @@index([userId, createdAt])
+  @@index([deviceId, status])
+  @@index([status])
+}
+
+model TaskAction {
+  id           String       @id @default(uuid())
+  taskId       String
+  task         Task         @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  actionId     String       @unique @default(uuid())
+  type         ActionType
+  /// Validated action parameters (coordinates, text, keys, etc.) — never raw shell
+  params       Json
+  status       ActionStatus @default(PENDING)
+  result       Json?
+  errorMessage String?
+  iteration    Int
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+  completedAt  DateTime?
+
+  @@index([taskId, createdAt])
+}
+
+model ChatMessage {
+  id        String      @id @default(uuid())
+  userId    String
+  user      User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  taskId    String?
+  task      Task?       @relation(fields: [taskId], references: [id], onDelete: SetNull)
+  role      MessageRole
+  content   String
+  metadata  Json?
+  createdAt DateTime    @default(now())
+
+  @@index([userId, createdAt])
+  @@index([taskId])
+}
+
+model AgentEvent {
+  id        String         @id @default(uuid())
+  deviceId  String?
+  device    Device?        @relation(fields: [deviceId], references: [id], onDelete: SetNull)
+  type      AgentEventType
+  event     String
+  payload   Json?
+  createdAt DateTime       @default(now())
+
+  @@index([deviceId, createdAt])
+  @@index([type, createdAt])
+}
