@@ -322,6 +322,33 @@ export class TasksService {
     return { requestId: input.requestId, deviceId: device.id, app: input.app };
   }
 
+  async requestLockAction(
+    userId: string,
+    action: 'LOCK_SCREEN' | 'UNLOCK_SCREEN',
+    input: { requestId: string; deviceId?: string },
+  ) {
+    const device = await this.devices.getActiveDeviceForUser(
+      userId,
+      input.deviceId,
+    );
+    if (!this.connections.isDeviceOnline(device.id)) {
+      throw new BadRequestException('Device is not connected via WebSocket');
+    }
+
+    this.pending.set(`lock_action-user:${input.requestId}`, userId, 120);
+    const sent = this.connections.sendToDevice(device.id, action, {
+      requestId: input.requestId,
+    });
+    if (!sent) {
+      this.pending.del(`lock_action-user:${input.requestId}`);
+      throw new BadRequestException('Failed to reach device');
+    }
+    this.logger.log(
+      `${action} forwarded to device=${device.id} requestId=${input.requestId}`,
+    );
+    return { requestId: input.requestId, deviceId: device.id };
+  }
+
   private async runAiIteration(
     taskId: string,
     screen: ScreenResultPayload,

@@ -32,6 +32,8 @@ import {
   appsResultSchema,
   captureScreenSchema,
   listQuerySchema,
+  lockActionSchema,
+  lockResultSchema,
   notifyResultSchema,
   notifySchema,
   pingSchema,
@@ -406,6 +408,26 @@ export class AppWebsocketGateway
     return { ok: true };
   }
 
+  @SubscribeMessage(WsEvent.LOCK_RESULT)
+  async onLockResult(
+    @ConnectedSocket() socket: Socket,
+    @MessageBody() body: unknown,
+  ) {
+    if (!this.requireAgent(socket)) {
+      return this.fail(socket, 'UNAUTHORIZED', 'Device not registered');
+    }
+    const parsed = lockResultSchema.safeParse(body);
+    if (!parsed.success) {
+      return this.fail(socket, 'VALIDATION_ERROR', 'Invalid LOCK_RESULT', parsed.error.issues);
+    }
+    const userId = this.pending.get(`lock_action-user:${parsed.data.requestId}`);
+    if (userId) {
+      this.connections.sendToUser(userId, WsEvent.LOCK_RESULT, parsed.data);
+      this.pending.del(`lock_action-user:${parsed.data.requestId}`);
+    }
+    return { ok: true };
+  }
+
   // -------- web-client events (Nest + bindWebClientHandlers; deduped by requestId) --------
 
   @SubscribeMessage(WsEvent.CAPTURE_SCREEN)
@@ -462,6 +484,22 @@ export class AppWebsocketGateway
     @MessageBody() body: unknown,
   ) {
     return this.onCloseApp(socket, body);
+  }
+
+  @SubscribeMessage(WsEvent.LOCK_SCREEN)
+  async onLockScreenSubscribe(
+    @ConnectedSocket() socket: Socket,
+    @MessageBody() body: unknown,
+  ) {
+    return this.onLockScreen(socket, body);
+  }
+
+  @SubscribeMessage(WsEvent.UNLOCK_SCREEN)
+  async onUnlockScreenSubscribe(
+    @ConnectedSocket() socket: Socket,
+    @MessageBody() body: unknown,
+  ) {
+    return this.onUnlockScreen(socket, body);
   }
 
   async onCaptureScreen(socket: Socket, body: unknown) {
@@ -660,6 +698,14 @@ export class AppWebsocketGateway
     return this.handleAppAction(socket, body, 'CLOSE_APP');
   }
 
+  async onLockScreen(socket: Socket, body: unknown) {
+    return this.handleLockAction(socket, body, 'LOCK_SCREEN');
+  }
+
+  async onUnlockScreen(socket: Socket, body: unknown) {
+    return this.handleLockAction(socket, body, 'UNLOCK_SCREEN');
+  }
+
   private async handleAppAction(
     socket: Socket,
     body: unknown,
@@ -690,6 +736,45 @@ export class AppWebsocketGateway
       return this.fail(
         socket,
         'APP_ACTION_FAILED',
+        err instanceof Error ? err.message : `${action} failed`,
+        undefined,
+        parsed.data.requestId,
+      );
+    } finally {
+      gate.release();
+    }
+  }
+
+  private async handleLockAction(
+    socket: Socket,
+    body: unknown,
+    action: 'LOCK_SCREEN' | 'UNLOCK_SCREEN',
+  ) {
+    if (socket.data.channel !== 'web-client' || !socket.data.userId) {
+      return this.fail(socket, 'FORBIDDEN', `${action} only for web-client`);
+    }
+    if (!(await this.rateLimit(socket))) {
+      return this.fail(socket, 'RATE_LIMITED', 'Too many messages');
+    }
+    const parsed = lockActionSchema.safeParse(body);
+    if (!parsed.success) {
+      return this.fail(socket, 'VALIDATION_ERROR', `Invalid ${action}`, parsed.error.issues);
+    }
+    const gate = this.beginRequest(`lock_action:${parsed.data.requestId}`);
+    if (!gate) {
+      return { ok: true, deduped: true, requestId: parsed.data.requestId };
+    }
+    try {
+      const result = await this.tasks.requestLockAction(
+        socket.data.userId,
+        action,
+        parsed.data,
+      );
+      return { ok: true, ...result };
+    } catch (err) {
+      return this.fail(
+        socket,
+        'LOCK_ACTION_FAILED',
         err instanceof Error ? err.message : `${action} failed`,
         undefined,
         parsed.data.requestId,
@@ -758,6 +843,8 @@ export class AppWebsocketGateway
         return this.onAppsResult(socket, body.payload);
       case WsEvent.APP_ACTION_RESULT:
         return this.onAppActionResult(socket, body.payload);
+      case WsEvent.LOCK_RESULT:
+        return this.onLockResult(socket, body.payload);
       case WsEvent.CAPTURE_SCREEN:
         return this.onCaptureScreen(socket, body.payload);
       case WsEvent.USER_MESSAGE:
@@ -772,6 +859,10 @@ export class AppWebsocketGateway
         return this.onOpenApp(socket, body.payload);
       case WsEvent.CLOSE_APP:
         return this.onCloseApp(socket, body.payload);
+      case WsEvent.LOCK_SCREEN:
+        return this.onLockScreen(socket, body.payload);
+      case WsEvent.UNLOCK_SCREEN:
+        return this.onUnlockScreen(socket, body.payload);
       case WsEvent.PING:
         return this.onPing(socket, body.payload);
       case WsEvent.PONG:
@@ -845,6 +936,8 @@ export class AppWebsocketGateway
     bind(WsEvent.LIST_APPS, this.onListApps);
     bind(WsEvent.OPEN_APP, this.onOpenApp);
     bind(WsEvent.CLOSE_APP, this.onCloseApp);
+    bind(WsEvent.LOCK_SCREEN, this.onLockScreen);
+    bind(WsEvent.UNLOCK_SCREEN, this.onUnlockScreen);
   }
 
   /** @returns release handle, or null if this requestId is already in flight */

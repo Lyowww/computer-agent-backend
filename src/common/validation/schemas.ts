@@ -110,6 +110,19 @@ export const appActionResultSchema = z.object({
   error: z.string().max(2000).optional(),
 });
 
+export const lockActionSchema = z.object({
+  requestId: z.string().min(1).max(64),
+  deviceId: z.string().uuid().optional(),
+});
+
+export const lockResultSchema = z.object({
+  requestId: z.string().min(1).max(64),
+  action: z.enum(['lock', 'unlock']),
+  success: z.boolean(),
+  alreadyUnlocked: z.boolean().optional(),
+  error: z.string().max(2000).optional(),
+});
+
 export const pingSchema = z.object({
   requestId: z.string().min(1).max(64).optional(),
   nonce: z.string().min(8).max(128).optional(),
