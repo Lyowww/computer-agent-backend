@@ -212,6 +212,58 @@ export class TasksService {
     return { requestId, deviceId: device.id };
   }
 
+  async captureCameraForUser(
+    userId: string,
+    opts: { deviceId?: string; quality?: number; requestId?: string },
+  ) {
+    const device = await this.devices.getActiveDeviceForUser(
+      userId,
+      opts.deviceId,
+    );
+    if (!this.connections.isDeviceOnline(device.id)) {
+      throw new BadRequestException('Device is not connected via WebSocket');
+    }
+
+    const requestId = opts.requestId ?? `req_${uuidv4()}`;
+    this.pending.set(`capture-camera-user:${requestId}`, userId, 120);
+
+    const sent = this.connections.sendToDevice(device.id, 'CAPTURE_CAMERA', {
+      requestId,
+      quality: opts.quality ?? 85,
+      maxWidth: 1280,
+      deviceId: device.id,
+    });
+    if (!sent) {
+      this.pending.del(`capture-camera-user:${requestId}`);
+      throw new BadRequestException('Failed to reach device');
+    }
+
+    this.logger.log(
+      `CAPTURE_CAMERA forwarded to device=${device.id} requestId=${requestId}`,
+    );
+    return { requestId, deviceId: device.id };
+  }
+
+  async handleCameraResult(payload: ScreenResultPayload): Promise<void> {
+    const captureUserId = this.pending.get(
+      `capture-camera-user:${payload.requestId}`,
+    );
+    if (!captureUserId) {
+      this.logger.debug(`Orphan camera result: ${payload.requestId}`);
+      return;
+    }
+    this.pending.del(`capture-camera-user:${payload.requestId}`);
+    this.connections.sendToUser(captureUserId, 'CAMERA_RESULT', {
+      requestId: payload.requestId,
+      taskId: payload.taskId,
+      width: payload.width,
+      height: payload.height,
+      image: payload.image,
+      mimeType: payload.mimeType ?? 'image/jpeg',
+      error: payload.error,
+    });
+  }
+
   async notifyDevice(
     userId: string,
     input: {

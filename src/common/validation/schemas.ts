@@ -35,6 +35,13 @@ export const captureScreenSchema = z.object({
   deviceId: z.string().uuid().optional(),
 });
 
+export const captureCameraSchema = z.object({
+  requestId: z.string().min(1).max(64),
+  quality: z.number().int().min(1).max(100).optional(),
+  taskId: z.string().uuid().optional(),
+  deviceId: z.string().uuid().optional(),
+});
+
 export const userMessageSchema = z.object({
   requestId: z.string().min(1).max(64).optional(),
   taskId: z.string().uuid().optional(),

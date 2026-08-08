@@ -31,6 +31,7 @@ import {
   appActionSchema,
   appsResultSchema,
   captureScreenSchema,
+  captureCameraSchema,
   listQuerySchema,
   lockActionSchema,
   lockResultSchema,
@@ -297,6 +298,28 @@ export class AppWebsocketGateway
     return { ok: true, requestId: parsed.data.requestId };
   }
 
+  @SubscribeMessage(WsEvent.CAMERA_RESULT)
+  async onCameraResult(
+    @ConnectedSocket() socket: Socket,
+    @MessageBody() body: unknown,
+  ) {
+    if (!this.requireAgent(socket)) {
+      return this.fail(socket, 'UNAUTHORIZED', 'Device not registered');
+    }
+    if (!(await this.rateLimit(socket))) {
+      return this.fail(socket, 'RATE_LIMITED', 'Too many messages');
+    }
+
+    const parsed = screenResultSchema.safeParse(body);
+    if (!parsed.success) {
+      return this.fail(socket, 'VALIDATION_ERROR', 'Invalid CAMERA_RESULT', parsed.error.issues);
+    }
+
+    await this.devices.touch(socket.data.deviceId);
+    await this.tasks.handleCameraResult(parsed.data);
+    return { ok: true, requestId: parsed.data.requestId };
+  }
+
   @SubscribeMessage(WsEvent.ACTION_RESULT)
   async onActionResult(
     @ConnectedSocket() socket: Socket,
@@ -438,6 +461,14 @@ export class AppWebsocketGateway
     return this.onCaptureScreen(socket, body);
   }
 
+  @SubscribeMessage(WsEvent.CAPTURE_CAMERA)
+  async onCaptureCameraSubscribe(
+    @ConnectedSocket() socket: Socket,
+    @MessageBody() body: unknown,
+  ) {
+    return this.onCaptureCamera(socket, body);
+  }
+
   @SubscribeMessage(WsEvent.USER_MESSAGE)
   async onUserMessageSubscribe(
     @ConnectedSocket() socket: Socket,
@@ -538,6 +569,50 @@ export class AppWebsocketGateway
         socket,
         'CAPTURE_FAILED',
         err instanceof Error ? err.message : 'Capture failed',
+        undefined,
+        parsed.data.requestId,
+      );
+    } finally {
+      gate.release();
+    }
+  }
+
+  async onCaptureCamera(socket: Socket, body: unknown) {
+    if (socket.data.channel !== 'web-client' || !socket.data.userId) {
+      return this.fail(socket, 'FORBIDDEN', 'CAPTURE_CAMERA only for web-client');
+    }
+    if (!(await this.rateLimit(socket))) {
+      return this.fail(socket, 'RATE_LIMITED', 'Too many messages');
+    }
+
+    const parsed = captureCameraSchema.safeParse(body);
+    if (!parsed.success) {
+      return this.fail(socket, 'VALIDATION_ERROR', 'Invalid CAPTURE_CAMERA', parsed.error.issues);
+    }
+
+    const gate = this.beginRequest(`capture_camera:${parsed.data.requestId}`);
+    if (!gate) {
+      return { ok: true, deduped: true, requestId: parsed.data.requestId };
+    }
+
+    try {
+      this.logger.log(
+        `CAPTURE_CAMERA from user=${socket.data.userId} device=${parsed.data.deviceId ?? 'auto'} requestId=${parsed.data.requestId}`,
+      );
+      const result = await this.tasks.captureCameraForUser(socket.data.userId, {
+        requestId: parsed.data.requestId,
+        quality: parsed.data.quality,
+        deviceId: parsed.data.deviceId,
+      });
+      return { ok: true, ...result };
+    } catch (err) {
+      this.logger.warn(
+        `CAPTURE_CAMERA failed: ${err instanceof Error ? err.message : err}`,
+      );
+      return this.fail(
+        socket,
+        'CAMERA_CAPTURE_FAILED',
+        err instanceof Error ? err.message : 'Camera capture failed',
         undefined,
         parsed.data.requestId,
       );
@@ -833,6 +908,8 @@ export class AppWebsocketGateway
         return this.onRegisterDevice(socket, body.payload);
       case WsEvent.SCREEN_RESULT:
         return this.onScreenResult(socket, body.payload);
+      case WsEvent.CAMERA_RESULT:
+        return this.onCameraResult(socket, body.payload);
       case WsEvent.ACTION_RESULT:
         return this.onActionResult(socket, body.payload);
       case WsEvent.NOTIFY_RESULT:
@@ -847,6 +924,8 @@ export class AppWebsocketGateway
         return this.onLockResult(socket, body.payload);
       case WsEvent.CAPTURE_SCREEN:
         return this.onCaptureScreen(socket, body.payload);
+      case WsEvent.CAPTURE_CAMERA:
+        return this.onCaptureCamera(socket, body.payload);
       case WsEvent.USER_MESSAGE:
         return this.onUserMessage(socket, body.payload);
       case WsEvent.NOTIFY:
@@ -930,6 +1009,7 @@ export class AppWebsocketGateway
     };
 
     bind(WsEvent.CAPTURE_SCREEN, this.onCaptureScreen);
+    bind(WsEvent.CAPTURE_CAMERA, this.onCaptureCamera);
     bind(WsEvent.USER_MESSAGE, this.onUserMessage);
     bind(WsEvent.NOTIFY, this.onNotify);
     bind(WsEvent.LIST_PROCESSES, this.onListProcesses);
