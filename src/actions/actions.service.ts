@@ -48,7 +48,14 @@ export class ActionsService {
       throw new NotFoundException('Action not found');
     }
 
-    return this.prisma.taskAction.update({
+    if (
+      existing.status === ActionStatus.SUCCEEDED ||
+      existing.status === ActionStatus.FAILED
+    ) {
+      return { action: existing, duplicate: true as const };
+    }
+
+    const action = await this.prisma.taskAction.update({
       where: { actionId: input.actionId },
       data: {
         status: input.success ? ActionStatus.SUCCEEDED : ActionStatus.FAILED,
@@ -57,6 +64,7 @@ export class ActionsService {
         completedAt: new Date(),
       },
     });
+    return { action, duplicate: false as const };
   }
 
   async listForTask(taskId: string) {

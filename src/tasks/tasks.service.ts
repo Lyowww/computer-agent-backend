@@ -18,10 +18,25 @@ import { assertOwnership } from '../common/guards/auth.guards';
 import type { CreateTaskDto } from '../common/validation/schemas';
 import type { AppConfig } from '../config/configuration';
 import type { ScreenResultPayload } from '../common/events/ws-events';
+import { inferExecutionMode, type ExecutionMode } from './execution-mode';
+import {
+  decideAfterActionBatch,
+  looksLikeFakeUserApproval,
+  shouldReplanOnNonExecutablePlan,
+} from './task-lifecycle';
 
 @Injectable()
 export class TasksService {
   private readonly logger = new Logger(TasksService.name);
+
+  /**
+   * Per-task planning guard: prevents SCREEN_RESULT / ACTION_RESULT / TASK_UPDATE
+   * from running overlapping plan cycles for the same task.
+   */
+  private readonly activePlanCycles = new Set<string>();
+
+  /** Cached mode for live tasks (instruction is stable for the task lifetime). */
+  private readonly executionModes = new Map<string, ExecutionMode>();
 
   constructor(
     private readonly prisma: PrismaService,
@@ -33,6 +48,22 @@ export class TasksService {
     private readonly pending: PendingStore,
     private readonly config: ConfigService,
   ) {}
+
+  private getExecutionMode(task: {
+    id: string;
+    instruction: string;
+  }): ExecutionMode {
+    const cached = this.executionModes.get(task.id);
+    if (cached) return cached;
+    const mode = inferExecutionMode(task.instruction);
+    this.executionModes.set(task.id, mode);
+    return mode;
+  }
+
+  private clearTaskRuntime(taskId: string): void {
+    this.activePlanCycles.delete(taskId);
+    this.executionModes.delete(taskId);
+  }
 
   async create(userId: string, dto: CreateTaskDto) {
     const app = this.config.get<AppConfig>('app')!;
@@ -89,7 +120,17 @@ export class TasksService {
   async requestScreenAndPlan(taskId: string): Promise<void> {
     const task = await this.prisma.task.findUnique({ where: { id: taskId } });
     if (!task) return;
-    if (this.isTerminal(task.status)) return;
+    if (this.isTerminal(task.status)) {
+      this.clearTaskRuntime(taskId);
+      return;
+    }
+
+    if (this.activePlanCycles.has(taskId)) {
+      this.logger.debug(
+        `Skipping duplicate screen/plan request for task ${taskId} (plan cycle active)`,
+      );
+      return;
+    }
 
     if (task.iteration >= task.maxIterations) {
       await this.failTask(taskId, 'Maximum task iterations exceeded');
@@ -178,9 +219,12 @@ export class TasksService {
       mimeType: payload.mimeType ?? 'image/png',
     });
 
-    if (!this.isTerminal(task.status)) {
-      await this.runAiIteration(taskId, payload);
+    if (this.isTerminal(task.status)) {
+      this.clearTaskRuntime(taskId);
+      return;
     }
+
+    await this.runAiIteration(taskId, payload);
   }
 
   async captureScreenForUser(
@@ -412,145 +456,221 @@ export class TasksService {
 
     const task = await this.prisma.task.findUnique({ where: { id: taskId } });
     if (!task || task.status === TaskStatus.CANCELLED) return;
+    if (this.isTerminal(task.status)) {
+      this.clearTaskRuntime(taskId);
+      return;
+    }
 
-    const nextIteration = task.iteration + 1;
-    await this.prisma.task.update({
-      where: { id: taskId },
-      data: { iteration: nextIteration, status: TaskStatus.RUNNING },
-    });
+    if (this.activePlanCycles.has(taskId)) {
+      this.logger.debug(
+        `Skipping duplicate AI iteration for task ${taskId} (plan cycle active)`,
+      );
+      return;
+    }
+    this.activePlanCycles.add(taskId);
 
-    const previousActions = await this.actions.toPreviousActions(taskId);
-    const app = this.config.get<AppConfig>('app')!;
-
-    let aiResponse;
     try {
-      aiResponse = await this.ai.planNextActions({
-        taskId,
-        userInstruction: task.instruction,
-        screenshot: {
-          width: screen.width,
-          height: screen.height,
-          image: screen.image,
-          mimeType: screen.mimeType,
-        },
-        previousActions,
+      const mode = this.getExecutionMode(task);
+      const nextIteration = task.iteration + 1;
+      await this.prisma.task.update({
+        where: { id: taskId },
+        data: { iteration: nextIteration, status: TaskStatus.RUNNING },
       });
-    } catch (err) {
-      await this.failTask(
-        taskId,
-        err instanceof Error ? err.message : 'AI service error',
-      );
-      return;
-    } finally {
-      if (!app.STORE_SCREENSHOTS) {
-        await this.screenshots.discard(screen.requestId);
-      }
-    }
 
-    if (aiResponse.message) {
-      await this.prisma.chatMessage.create({
-        data: {
-          userId: task.userId,
+      const previousActions = await this.actions.toPreviousActions(taskId);
+      const app = this.config.get<AppConfig>('app')!;
+      const userReply = this.pending.get(`user-reply:${taskId}`) ?? undefined;
+      if (userReply) {
+        this.pending.del(`user-reply:${taskId}`);
+      }
+
+      let aiResponse;
+      try {
+        aiResponse = await this.ai.planNextActions({
           taskId,
-          role: MessageRole.ASSISTANT,
+          userInstruction: task.instruction,
+          screenshot: {
+            width: screen.width,
+            height: screen.height,
+            image: screen.image,
+            mimeType: screen.mimeType,
+          },
+          previousActions,
+          iteration: task.iteration,
+          executionMode: mode,
+          userReply,
+        });
+      } catch (err) {
+        await this.failTask(
+          taskId,
+          err instanceof Error ? err.message : 'AI service error',
+        );
+        return;
+      } finally {
+        if (!app.STORE_SCREENSHOTS) {
+          await this.screenshots.discard(screen.requestId);
+        }
+      }
+
+      // Prefer server-inferred mode; allow AI response override if present
+      const effectiveMode = aiResponse.executionMode ?? mode;
+      this.executionModes.set(taskId, effectiveMode);
+
+      if (aiResponse.message) {
+        await this.prisma.chatMessage.create({
+          data: {
+            userId: task.userId,
+            taskId,
+            role: MessageRole.ASSISTANT,
+            content: aiResponse.message,
+          },
+        });
+        this.connections.sendToUser(task.userId, 'AI_RESPONSE', {
+          taskId,
           content: aiResponse.message,
-        },
-      });
-      this.connections.sendToUser(task.userId, 'AI_RESPONSE', {
-        taskId,
-        content: aiResponse.message,
-        actions: aiResponse.actions,
-      });
-    }
-
-    if (
-      aiResponse.status === 'completed' ||
-      this.hasTerminal(aiResponse.actions, 'DONE')
-    ) {
-      await this.completeTask(taskId, aiResponse.message ?? 'Task completed');
-      return;
-    }
-
-    if (
-      aiResponse.status === 'failed' ||
-      this.hasTerminal(aiResponse.actions, 'FAIL')
-    ) {
-      await this.failTask(taskId, aiResponse.message ?? 'AI reported failure');
-      return;
-    }
-
-    if (aiResponse.status === 'need_user') {
-      await this.updateStatus(taskId, TaskStatus.WAITING_FOR_USER);
-      return;
-    }
-
-    const askUser = aiResponse.actions.find((a) => a.type === 'ASK_USER');
-    if (askUser) {
-      await this.actions.createActions(taskId, nextIteration, [askUser]);
-      const question =
-        typeof askUser.params.question === 'string'
-          ? askUser.params.question
-          : aiResponse.message ?? 'User input required';
-      this.connections.sendToUser(task.userId, 'ASK_USER', {
-        taskId,
-        question,
-        reason:
-          typeof askUser.params.reason === 'string'
-            ? askUser.params.reason
-            : undefined,
-      });
-      await this.updateStatus(taskId, TaskStatus.WAITING_FOR_USER);
-      return;
-    }
-
-    const executable = aiResponse.actions.filter(
-      (a) =>
-        a.type !== 'DONE' &&
-        a.type !== 'FAIL' &&
-        a.type !== 'WAIT' &&
-        a.type !== 'ASK_USER' &&
-        a.type !== 'SCREENSHOT',
-    );
-
-    if (executable.length === 0) {
-      const waitAction = aiResponse.actions.find((a) => a.type === 'WAIT');
-      if (waitAction) {
-        await this.actions.createActions(taskId, nextIteration, [waitAction]);
-        const ms = Number(
-          waitAction.params.ms ?? waitAction.params.durationMs ?? 500,
-        );
-        await new Promise((r) =>
-          setTimeout(r, Math.min(Math.max(ms, 100), 10_000)),
-        );
+          actions: aiResponse.actions,
+        });
       }
-      // SCREENSHOT-only (or empty after filtering) → capture again and replan
-      await this.requestScreenAndPlan(taskId);
-      return;
-    }
 
-    const created = await this.actions.createActions(
-      taskId,
-      nextIteration,
-      executable,
-    );
-    await this.updateStatus(taskId, TaskStatus.WAITING_FOR_ACTION);
-
-    for (const action of created) {
-      await this.actions.markSent(action.actionId);
-      const sent = this.connections.sendToDevice(
-        task.deviceId,
-        'EXECUTE_ACTION',
-        {
-          actionId: action.actionId,
+      // Block fake approval simulation from the model
+      if (
+        looksLikeFakeUserApproval({
+          message: aiResponse.message,
+          actions: aiResponse.actions,
+        })
+      ) {
+        this.connections.sendToUser(task.userId, 'ASK_USER', {
           taskId,
-          type: action.type,
-          params: action.params,
-        },
-      );
-      if (!sent) {
-        await this.failTask(taskId, 'Device disconnected while sending action');
+          question:
+            'I need your real confirmation to continue. Please reply here — I will not click Approve or type into the control UI.',
+          reason: 'Automatic approval is forbidden',
+        });
+        await this.updateStatus(taskId, TaskStatus.WAITING_FOR_USER);
         return;
       }
+
+      const hasDone = this.hasTerminal(aiResponse.actions, 'DONE');
+      const executable = aiResponse.actions.filter(
+        (a) =>
+          a.type !== 'DONE' &&
+          a.type !== 'FAIL' &&
+          a.type !== 'WAIT' &&
+          a.type !== 'ASK_USER' &&
+          a.type !== 'SCREENSHOT',
+      );
+
+      // COMPLETED / DONE with no remaining executable work → finish immediately
+      if (
+        (aiResponse.status === 'completed' || hasDone) &&
+        executable.length === 0
+      ) {
+        await this.completeTask(taskId, aiResponse.message ?? 'Task completed');
+        return;
+      }
+
+      if (
+        aiResponse.status === 'failed' ||
+        this.hasTerminal(aiResponse.actions, 'FAIL')
+      ) {
+        await this.failTask(taskId, aiResponse.message ?? 'AI reported failure');
+        return;
+      }
+
+      if (aiResponse.status === 'need_user') {
+        await this.updateStatus(taskId, TaskStatus.WAITING_FOR_USER);
+        return;
+      }
+
+      const askUser = aiResponse.actions.find((a) => a.type === 'ASK_USER');
+      if (askUser) {
+        await this.actions.createActions(taskId, nextIteration, [askUser]);
+        const question =
+          typeof askUser.params.question === 'string'
+            ? askUser.params.question
+            : aiResponse.message ?? 'User input required';
+        this.connections.sendToUser(task.userId, 'ASK_USER', {
+          taskId,
+          question,
+          reason:
+            typeof askUser.params.reason === 'string'
+              ? askUser.params.reason
+              : undefined,
+        });
+        await this.updateStatus(taskId, TaskStatus.WAITING_FOR_USER);
+        return;
+      }
+
+      if (executable.length === 0) {
+        const waitAction = aiResponse.actions.find((a) => a.type === 'WAIT');
+        if (
+          waitAction &&
+          shouldReplanOnNonExecutablePlan({
+            mode: effectiveMode,
+            wireStatus: aiResponse.status ?? 'continue',
+            hasDone,
+          })
+        ) {
+          await this.actions.createActions(taskId, nextIteration, [waitAction]);
+          const ms = Number(
+            waitAction.params.ms ?? waitAction.params.durationMs ?? 500,
+          );
+          await new Promise((r) =>
+            setTimeout(r, Math.min(Math.max(ms, 100), 10_000)),
+          );
+        }
+
+        if (
+          shouldReplanOnNonExecutablePlan({
+            mode: effectiveMode,
+            wireStatus: aiResponse.status ?? 'continue',
+            hasDone,
+          })
+        ) {
+          // multi_step only: SCREENSHOT/WAIT → capture again and replan
+          this.activePlanCycles.delete(taskId);
+          await this.requestScreenAndPlan(taskId);
+          return;
+        }
+
+        // single_action with no executable work → stop (do not loop)
+        await this.completeTask(
+          taskId,
+          aiResponse.message ?? 'No further action required',
+        );
+        return;
+      }
+
+      const created = await this.actions.createActions(
+        taskId,
+        nextIteration,
+        executable,
+      );
+      await this.updateStatus(taskId, TaskStatus.WAITING_FOR_ACTION);
+
+      // If the plan also marked COMPLETED/DONE alongside actions, complete after execute
+      if (aiResponse.status === 'completed' || hasDone) {
+        this.pending.set(`complete-after-actions:${taskId}`, '1', 300);
+      }
+
+      for (const action of created) {
+        await this.actions.markSent(action.actionId);
+        const sent = this.connections.sendToDevice(
+          task.deviceId,
+          'EXECUTE_ACTION',
+          {
+            actionId: action.actionId,
+            taskId,
+            type: action.type,
+            params: action.params,
+          },
+        );
+        if (!sent) {
+          await this.failTask(taskId, 'Device disconnected while sending action');
+          return;
+        }
+      }
+    } finally {
+      this.activePlanCycles.delete(taskId);
     }
   }
 
@@ -561,11 +681,23 @@ export class TasksService {
     result?: Record<string, unknown>;
     error?: string;
   }): Promise<void> {
-    const action = await this.actions.recordResult(input);
+    const recorded = await this.actions.recordResult(input);
+
+    // Duplicate ACTION_RESULT — do not re-trigger planning
+    if (recorded.duplicate) {
+      this.logger.debug(
+        `Ignoring duplicate ACTION_RESULT for ${input.actionId}`,
+      );
+      return;
+    }
+
     const task = await this.prisma.task.findUnique({
       where: { id: input.taskId },
     });
-    if (!task || this.isTerminal(task.status)) return;
+    if (!task || this.isTerminal(task.status)) {
+      this.clearTaskRuntime(input.taskId);
+      return;
+    }
 
     this.connections.sendToUser(task.userId, 'ACTION_RESULT', {
       actionId: input.actionId,
@@ -578,17 +710,68 @@ export class TasksService {
     const pending = await this.prisma.taskAction.count({
       where: {
         taskId: input.taskId,
-        iteration: action.iteration,
+        iteration: recorded.action.iteration,
         status: { in: ['PENDING', 'SENT'] },
       },
     });
 
-    if (pending === 0) {
-      if (!input.success) {
-        this.logger.warn(`Action ${input.actionId} failed: ${input.error}`);
-      }
-      await this.requestScreenAndPlan(input.taskId);
+    if (pending > 0) {
+      return;
     }
+
+    const mode = this.getExecutionMode(task);
+    const iterationActions = await this.prisma.taskAction.findMany({
+      where: {
+        taskId: input.taskId,
+        iteration: recorded.action.iteration,
+      },
+    });
+    const allSucceeded = iterationActions.every(
+      (a) => a.status === 'SUCCEEDED',
+    );
+    const failed = iterationActions.find((a) => a.status === 'FAILED');
+
+    // Explicit complete-after-actions from a DONE+action plan
+    const completeAfter = this.pending.get(
+      `complete-after-actions:${input.taskId}`,
+    );
+    if (completeAfter) {
+      this.pending.del(`complete-after-actions:${input.taskId}`);
+      if (allSucceeded) {
+        await this.completeTask(input.taskId, 'Task completed');
+      } else {
+        await this.failTask(
+          input.taskId,
+          failed?.errorMessage ?? input.error ?? 'Action failed',
+        );
+      }
+      return;
+    }
+
+    const decision = decideAfterActionBatch({
+      mode,
+      allSucceeded,
+      lastError: failed?.errorMessage ?? input.error,
+      isTerminal: this.isTerminal(task.status),
+    });
+
+    if (decision.kind === 'complete') {
+      await this.completeTask(input.taskId, decision.summary);
+      return;
+    }
+    if (decision.kind === 'fail') {
+      await this.failTask(input.taskId, decision.error);
+      return;
+    }
+    if (decision.kind === 'noop') {
+      return;
+    }
+
+    // multi_step only reaches replan
+    if (!input.success) {
+      this.logger.warn(`Action ${input.actionId} failed: ${input.error}`);
+    }
+    await this.requestScreenAndPlan(input.taskId);
   }
 
   async cancel(userId: string, taskId: string) {
@@ -600,6 +783,7 @@ export class TasksService {
       where: { id: taskId },
       data: { status: TaskStatus.CANCELLED, completedAt: new Date() },
     });
+    this.clearTaskRuntime(taskId);
     this.connections.sendToUser(userId, 'TASK_UPDATE', {
       taskId,
       status: TaskStatus.CANCELLED,
@@ -690,10 +874,8 @@ export class TasksService {
     if (input.taskId) {
       const task = await this.getOwned(userId, input.taskId);
       if (task.status === TaskStatus.WAITING_FOR_USER) {
-        await this.prisma.task.update({
-          where: { id: task.id },
-          data: { instruction: `${task.instruction}\n\nUser: ${input.content}` },
-        });
+        // Keep original instruction; pass the reply separately to the planner
+        this.pending.set(`user-reply:${task.id}`, input.content, 600);
         await this.requestScreenAndPlan(task.id);
         return { ok: true, mode: 'ai' as const, resumedTaskId: task.id };
       }
@@ -744,6 +926,7 @@ export class TasksService {
         completedAt: new Date(),
       },
     });
+    this.clearTaskRuntime(taskId);
     this.connections.sendToUser(task.userId, 'TASK_COMPLETED', {
       taskId,
       status: TaskStatus.COMPLETED,
@@ -760,6 +943,7 @@ export class TasksService {
         completedAt: new Date(),
       },
     });
+    this.clearTaskRuntime(taskId);
     this.connections.sendToUser(task.userId, 'TASK_FAILED', {
       taskId,
       status: TaskStatus.FAILED,

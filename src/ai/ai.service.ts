@@ -25,6 +25,9 @@ export interface AiRequest {
   userInstruction: string;
   screenshot: AiScreenshot;
   previousActions: AiPreviousAction[];
+  iteration?: number;
+  executionMode?: 'single_action' | 'multi_step';
+  userReply?: string;
 }
 
 export interface AiServicePort {
@@ -65,6 +68,9 @@ export class AiService implements AiServicePort {
           userInstruction: request.userInstruction,
           screenshot: request.screenshot,
           previousActions: request.previousActions,
+          iteration: request.iteration,
+          executionMode: request.executionMode,
+          userReply: request.userReply,
         }),
         signal: controller.signal,
       });

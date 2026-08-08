@@ -235,6 +235,7 @@ export const aiServiceResponseSchema = z.object({
   status: z.enum(['continue', 'completed', 'failed', 'need_user']).optional(),
   message: z.string().max(8000).optional(),
   actions: z.array(validatedActionSchema).max(20).default([]),
+  executionMode: z.enum(['single_action', 'multi_step']).optional(),
 });
 
 export const executeActionSchema = z
