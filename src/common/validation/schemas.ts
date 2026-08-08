@@ -165,17 +165,35 @@ export const actionTypeSchema = z.enum([
   'CLICK',
   'DOUBLE_CLICK',
   'RIGHT_CLICK',
-  'TYPE',
-  'KEY',
-  'SCROLL',
-  'MOVE',
-  'DRAG',
+  'MOVE_MOUSE',
+  'TYPE_TEXT',
+  'KEY_PRESS',
+  'HOTKEY',
+  'OPEN_APP',
   'WAIT',
+  'SCREENSHOT',
+  'SCROLL',
+  'DRAG',
   'LOCK_SCREEN',
   'UNLOCK_SCREEN',
   'DONE',
   'FAIL',
+  'ASK_USER',
+  // Legacy aliases accepted from older planners, normalized before persistence
+  'TYPE',
+  'KEY',
+  'MOVE',
 ]);
+
+const ACTION_TYPE_ALIASES: Record<string, string> = {
+  TYPE: 'TYPE_TEXT',
+  KEY: 'KEY_PRESS',
+  MOVE: 'MOVE_MOUSE',
+};
+
+export function normalizeBackendActionType(type: string): string {
+  return ACTION_TYPE_ALIASES[type] ?? type;
+}
 
 /** Never accept shell / exec / open-url arbitrary commands */
 const forbiddenActionKeys = [
@@ -201,11 +219,16 @@ export const actionParamsSchema = z
     }
   });
 
-export const validatedActionSchema = z.object({
-  type: actionTypeSchema,
-  params: actionParamsSchema.default({}),
-  reason: z.string().max(1000).optional(),
-});
+export const validatedActionSchema = z
+  .object({
+    type: actionTypeSchema,
+    params: actionParamsSchema.default({}),
+    reason: z.string().max(1000).optional(),
+  })
+  .transform((action) => ({
+    ...action,
+    type: normalizeBackendActionType(action.type) as typeof action.type,
+  }));
 
 export const aiServiceResponseSchema = z.object({
   taskId: z.string(),
@@ -214,12 +237,17 @@ export const aiServiceResponseSchema = z.object({
   actions: z.array(validatedActionSchema).max(20).default([]),
 });
 
-export const executeActionSchema = z.object({
-  actionId: z.string().min(1).max(64),
-  taskId: z.string().uuid(),
-  type: actionTypeSchema,
-  params: actionParamsSchema,
-});
+export const executeActionSchema = z
+  .object({
+    actionId: z.string().min(1).max(64),
+    taskId: z.string().uuid(),
+    type: actionTypeSchema,
+    params: actionParamsSchema,
+  })
+  .transform((payload) => ({
+    ...payload,
+    type: normalizeBackendActionType(payload.type) as typeof payload.type,
+  }));
 
 export const actionResultSchema = z.object({
   actionId: z.string().min(1).max(64),

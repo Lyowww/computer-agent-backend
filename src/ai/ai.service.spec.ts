@@ -62,6 +62,7 @@ describe('AiService', () => {
 
     expect(result.actions[0].params).toEqual({ text: 'hello' });
     expect(result.actions[0].params.shell).toBeUndefined();
+    expect(result.actions[0].type).toBe('TYPE_TEXT');
   });
 
   it('throws when AI service is down', async () => {

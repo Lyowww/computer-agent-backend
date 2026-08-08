@@ -484,8 +484,32 @@ export class TasksService {
       return;
     }
 
+    const askUser = aiResponse.actions.find((a) => a.type === 'ASK_USER');
+    if (askUser) {
+      await this.actions.createActions(taskId, nextIteration, [askUser]);
+      const question =
+        typeof askUser.params.question === 'string'
+          ? askUser.params.question
+          : aiResponse.message ?? 'User input required';
+      this.connections.sendToUser(task.userId, 'ASK_USER', {
+        taskId,
+        question,
+        reason:
+          typeof askUser.params.reason === 'string'
+            ? askUser.params.reason
+            : undefined,
+      });
+      await this.updateStatus(taskId, TaskStatus.WAITING_FOR_USER);
+      return;
+    }
+
     const executable = aiResponse.actions.filter(
-      (a) => a.type !== 'DONE' && a.type !== 'FAIL' && a.type !== 'WAIT',
+      (a) =>
+        a.type !== 'DONE' &&
+        a.type !== 'FAIL' &&
+        a.type !== 'WAIT' &&
+        a.type !== 'ASK_USER' &&
+        a.type !== 'SCREENSHOT',
     );
 
     if (executable.length === 0) {
@@ -496,9 +520,10 @@ export class TasksService {
           waitAction.params.ms ?? waitAction.params.durationMs ?? 500,
         );
         await new Promise((r) =>
-          setTimeout(r, Math.min(Math.max(ms, 0), 10_000)),
+          setTimeout(r, Math.min(Math.max(ms, 100), 10_000)),
         );
       }
+      // SCREENSHOT-only (or empty after filtering) → capture again and replan
       await this.requestScreenAndPlan(taskId);
       return;
     }
